@@ -132,8 +132,8 @@ async fn handle_connection(conn: quinn::Connection) -> Result<(), Box<dyn std::e
                         }
                     }
 
-                    // Send total back to client
-                    let _ = send.write_all(&total.to_be_bytes()).await;
+                    // Send total back to client as text (matches Go sqperf format)
+                    let _ = send.write_all(total.to_string().as_bytes()).await;
                     let _ = send.finish();
                 }
                 b'D' => {
@@ -213,10 +213,13 @@ async fn run_upload(
     }
     send.finish()?;
 
-    // Read server-confirmed bytes
-    let mut server_total = [0u8; 8];
-    let _ = recv.read_exact(&mut server_total).await;
-    let confirmed = u64::from_be_bytes(server_total);
+    // Read server-confirmed bytes (text format, matches Go sqperf)
+    let mut server_buf = vec![0u8; 64];
+    let n = recv.read(&mut server_buf).await?.unwrap_or(0);
+    let confirmed: u64 = String::from_utf8_lossy(&server_buf[..n])
+        .trim()
+        .parse()
+        .unwrap_or(0);
 
     let elapsed = start.elapsed().as_secs_f64();
     eprintln!("  server confirmed: {} bytes", confirmed);
