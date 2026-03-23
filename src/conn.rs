@@ -106,24 +106,43 @@ impl AsyncUdpSocket for ServerSocket {
             if let Ok(count) = self.io.try_io(Interest::READABLE, || {
                 self.inner.recv((&*self.io).into(), bufs, metas)
             }) {
-                // Validate each received packet
+                // Validate each received packet in place.
+                // Strip MAC overhead from Initial packets by adjusting meta.len.
+                // Invalid packets get meta.len = 0 and are counted as dropped.
                 let mut valid = 0;
                 for i in 0..count {
                     let len = metas[i].len;
-                    let buf = &mut bufs[0][..len]; // simplified: single buffer
+                    let buf = &mut bufs[i][..len];
                     match self.validate_and_strip(buf, len) {
                         Some(new_len) => {
-                            metas[valid] = metas[i];
-                            metas[valid].len = new_len;
+                            metas[i].len = new_len;
                             valid += 1;
                         }
-                        None => {} // silently drop
+                        None => {
+                            metas[i].len = 0; // mark as dropped
+                        }
+                    }
+                }
+                // Remove dropped packets by compacting metas
+                // (Quinn expects contiguous valid entries)
+                if valid < count {
+                    let mut write = 0;
+                    for read in 0..count {
+                        if metas[read].len > 0 {
+                            if write != read {
+                                metas[write] = metas[read];
+                                // Copy packet data to compacted position
+                                let len = metas[write].len;
+                                let (left, right) = bufs.split_at_mut(read);
+                                left[write][..len].copy_from_slice(&right[0][..len]);
+                            }
+                            write += 1;
+                        }
                     }
                 }
                 if valid == 0 {
                     // All dropped, need to poll again
-                    cx.waker().wake_by_ref();
-                    return Poll::Pending;
+                    continue;
                 } else {
                     return Poll::Ready(Ok(valid));
                 }
@@ -136,15 +155,15 @@ impl AsyncUdpSocket for ServerSocket {
     }
 
     fn may_fragment(&self) -> bool {
-        false
+        self.inner.may_fragment()
     }
 
     fn max_transmit_segments(&self) -> usize {
-        1
+        self.inner.max_gso_segments()
     }
 
     fn max_receive_segments(&self) -> usize {
-        1
+        self.inner.gro_segments()
     }
 }
 
@@ -201,7 +220,7 @@ impl AsyncUdpSocket for ClientSocket {
                 destination: transmit.destination,
                 ecn: transmit.ecn,
                 contents: &buf,
-                segment_size: transmit.segment_size,
+                segment_size: None, // Initial is a single packet; disable GSO to avoid size mismatch from MAC1 overhead
                 src_ip: transmit.src_ip,
             };
             self.io.try_io(Interest::WRITABLE, || {
@@ -235,15 +254,15 @@ impl AsyncUdpSocket for ClientSocket {
     }
 
     fn may_fragment(&self) -> bool {
-        false
+        self.inner.may_fragment()
     }
 
     fn max_transmit_segments(&self) -> usize {
-        1
+        self.inner.max_gso_segments()
     }
 
     fn max_receive_segments(&self) -> usize {
-        1
+        self.inner.gro_segments()
     }
 }
 

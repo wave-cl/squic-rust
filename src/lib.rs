@@ -134,6 +134,9 @@ pub async fn listen(
     ));
     transport.max_concurrent_bidi_streams(config.max_incoming_streams.try_into().unwrap());
     transport.max_concurrent_uni_streams(config.max_incoming_streams.try_into().unwrap());
+    transport.stream_receive_window(1_048_576u32.into()); // 1MB per stream
+    transport.receive_window(10_485_760u32.into()); // 10MB per connection
+    transport.send_window(10_485_760u64); // 10MB send window
     server_config.transport_config(Arc::new(transport));
 
     let runtime = quinn::default_runtime()
@@ -183,6 +186,9 @@ pub async fn dial(
     transport.max_idle_timeout(Some(
         config.max_idle_timeout.try_into().unwrap(),
     ));
+    transport.stream_receive_window(1_048_576u32.into()); // 1MB per stream
+    transport.receive_window(10_485_760u32.into()); // 10MB per connection
+    transport.send_window(10_485_760u64); // 10MB send window
     client_config.transport_config(Arc::new(transport));
 
     let runtime = quinn::default_runtime()

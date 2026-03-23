@@ -21,9 +21,16 @@ squic = { git = "https://github.com/wave-cl/squic-rust" }
 
 | Mode | macOS M4 Pro | Cheapest Linux VPS |
 |------|-------------|-------------------|
-| Upload | 1,977 Mbps | 1,098 Mbps |
-| Download | 1,872 Mbps | 1,143 Mbps |
-| Bidirectional | 2,556 Mbps total | 1,252 Mbps total |
+| Upload | 2,023 Mbps | 2,510 Mbps |
+| Download | 1,918 Mbps | 2,287 Mbps |
+| Bidirectional | 2,571 Mbps total | 4,797 Mbps total |
+
+Cross-implementation (Rust↔Go, same wire format):
+
+| Mode | macOS M4 Pro | Cheapest Linux VPS |
+|------|-------------|-------------------|
+| Go client → Rust server | 1,679 Mbps | 1,849 Mbps |
+| Rust server → Go client | 1,662 Mbps | 1,791 Mbps |
 
 Measured with the included sqperf tool over loopback, 30-second runs.
 
