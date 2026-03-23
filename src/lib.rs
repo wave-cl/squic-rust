@@ -13,6 +13,24 @@ use std::time::Duration;
 use whitelist::Whitelist;
 use x25519_dalek::PublicKey as X25519Public;
 
+/// Create a UDP socket with 2MB send/recv buffers for high-throughput QUIC.
+/// Linux defaults to ~160KB which causes ACK loss at high data rates.
+fn create_udp_socket(addr: SocketAddr) -> std::result::Result<std::net::UdpSocket, Error> {
+    let domain = if addr.is_ipv6() {
+        socket2::Domain::IPV6
+    } else {
+        socket2::Domain::IPV4
+    };
+    let sock = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))
+        .map_err(|e| Error::Io(e))?;
+    // 2MB buffers — critical on Linux where defaults are ~160KB
+    let _ = sock.set_recv_buffer_size(2 * 1024 * 1024);
+    let _ = sock.set_send_buffer_size(2 * 1024 * 1024);
+    sock.set_nonblocking(true).map_err(|e| Error::Io(e))?;
+    sock.bind(&addr.into()).map_err(|e| Error::Io(e))?;
+    Ok(sock.into())
+}
+
 /// Errors returned by sQUIC operations.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -38,6 +56,26 @@ pub struct Config {
     pub alpn_protocols: Vec<Vec<u8>>,
     /// Optional client key whitelist (X25519 public keys).
     pub allowed_keys: Option<Vec<[u8; 32]>>,
+
+    /// Send periodic keep-alive packets. Default: None (disabled).
+    pub keep_alive: Option<Duration>,
+    /// Maximum time for handshake to complete. Default: None (Quinn default: 10s).
+    pub handshake_timeout: Option<Duration>,
+    /// Per-stream receive window. Default: None (1 MB).
+    pub stream_receive_window: Option<u64>,
+    /// Connection-level receive window. Default: None (10 MB).
+    pub receive_window: Option<u64>,
+    /// Maximum unacknowledged data. Default: None (10 MB).
+    pub send_window: Option<u64>,
+
+    /// Initial UDP payload size. Range: 1200-65000. Default: None (1200).
+    pub initial_mtu: Option<u16>,
+    /// Disable path MTU discovery. Default: false.
+    pub disable_mtu_discovery: bool,
+    /// Enable QUIC datagram support (RFC 9221). Default: false.
+    pub enable_datagrams: bool,
+    /// Initial RTT estimate. Default: None (333ms).
+    pub initial_rtt: Option<Duration>,
 }
 
 impl Default for Config {
@@ -47,6 +85,15 @@ impl Default for Config {
             max_incoming_streams: 100,
             alpn_protocols: vec![b"squic".to_vec()],
             allowed_keys: None,
+            keep_alive: None,
+            handshake_timeout: None,
+            stream_receive_window: None,
+            receive_window: None,
+            send_window: None,
+            initial_mtu: None,
+            disable_mtu_discovery: false,
+            enable_datagrams: false,
+            initial_rtt: None,
         }
     }
 }
@@ -104,6 +151,36 @@ impl ServerListener {
     }
 }
 
+fn build_transport_config(config: &Config) -> quinn::TransportConfig {
+    let mut transport = quinn::TransportConfig::default();
+    transport.max_idle_timeout(Some(config.max_idle_timeout.try_into().unwrap()));
+
+    let stream_window = config.stream_receive_window.unwrap_or(1_048_576);
+    let conn_window = config.receive_window.unwrap_or(10_485_760);
+    let send_window = config.send_window.unwrap_or(10_485_760);
+    transport.stream_receive_window((stream_window as u32).into());
+    transport.receive_window((conn_window as u32).into());
+    transport.send_window(send_window);
+
+    if let Some(ka) = config.keep_alive {
+        transport.keep_alive_interval(Some(ka));
+    }
+    if let Some(mtu) = config.initial_mtu {
+        transport.initial_mtu(mtu);
+    }
+    if config.disable_mtu_discovery {
+        transport.mtu_discovery_config(None);
+    }
+    if config.enable_datagrams {
+        transport.datagram_receive_buffer_size(Some(1_048_576));
+    }
+    if let Some(rtt) = config.initial_rtt {
+        transport.initial_rtt(rtt);
+    }
+
+    transport
+}
+
 /// Start a sQUIC server.
 pub async fn listen(
     addr: SocketAddr,
@@ -115,8 +192,8 @@ pub async fn listen(
         config.allowed_keys.as_deref(),
     ));
 
-    let socket = tokio::net::UdpSocket::bind(addr).await?;
-    let socket = Arc::new(socket);
+    let std_socket = create_udp_socket(addr)?;
+    let socket = Arc::new(tokio::net::UdpSocket::from_std(std_socket).map_err(Error::Io)?);
 
     let server_socket = ServerSocket::new(socket, server_x25519_priv, whitelist.clone());
 
@@ -128,15 +205,9 @@ pub async fn listen(
         })?;
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_server_config));
 
-    let mut transport = quinn::TransportConfig::default();
-    transport.max_idle_timeout(Some(
-        config.max_idle_timeout.try_into().unwrap(),
-    ));
+    let mut transport = build_transport_config(&config);
     transport.max_concurrent_bidi_streams(config.max_incoming_streams.try_into().unwrap());
     transport.max_concurrent_uni_streams(config.max_incoming_streams.try_into().unwrap());
-    transport.stream_receive_window(1_048_576u32.into()); // 1MB per stream
-    transport.receive_window(10_485_760u32.into()); // 10MB per connection
-    transport.send_window(10_485_760u64); // 10MB send window
     server_config.transport_config(Arc::new(transport));
 
     let runtime = quinn::default_runtime()
@@ -169,8 +240,9 @@ pub async fn dial(
     let server_x25519_pub = ed25519_public_to_x25519(server_pub_key)?;
     let shared = x25519(&client_x25519_priv, &server_x25519_pub);
 
-    let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
-    let socket = Arc::new(socket);
+    let bind_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
+    let std_socket = create_udp_socket(bind_addr)?;
+    let socket = Arc::new(tokio::net::UdpSocket::from_std(std_socket).map_err(Error::Io)?);
 
     let client_socket = ClientSocket::new(socket, shared, client_x25519_pub.to_bytes());
 
@@ -182,13 +254,7 @@ pub async fn dial(
         })?;
     let mut client_config = quinn::ClientConfig::new(Arc::new(quic_client_config));
 
-    let mut transport = quinn::TransportConfig::default();
-    transport.max_idle_timeout(Some(
-        config.max_idle_timeout.try_into().unwrap(),
-    ));
-    transport.stream_receive_window(1_048_576u32.into()); // 1MB per stream
-    transport.receive_window(10_485_760u32.into()); // 10MB per connection
-    transport.send_window(10_485_760u64); // 10MB send window
+    let transport = build_transport_config(&config);
     client_config.transport_config(Arc::new(transport));
 
     let runtime = quinn::default_runtime()
