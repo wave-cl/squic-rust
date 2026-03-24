@@ -76,6 +76,8 @@ pub struct Config {
     pub enable_datagrams: bool,
     /// Initial RTT estimate. Default: None (333ms).
     pub initial_rtt: Option<Duration>,
+    /// Disable active connection migration (RFC 9000 §9). Default: false.
+    pub disable_active_migration: bool,
     /// Allow 0-RTT resumption. Has replay attack implications. Default: false.
     pub enable_0rtt: bool,
     /// Optional hex-encoded Ed25519 private key seed (64 hex chars).
@@ -100,6 +102,7 @@ impl Default for Config {
             disable_mtu_discovery: false,
             enable_datagrams: false,
             initial_rtt: None,
+            disable_active_migration: false,
             enable_0rtt: false,
             client_key: None,
         }
@@ -185,7 +188,6 @@ fn build_transport_config(config: &Config) -> quinn::TransportConfig {
     if let Some(rtt) = config.initial_rtt {
         transport.initial_rtt(rtt);
     }
-
     transport
 }
 
@@ -212,6 +214,9 @@ pub async fn listen(
             crate::Error::Tls(format!("quic server config: {e}"))
         })?;
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_server_config));
+    if config.disable_active_migration {
+        server_config.migration(false);
+    }
 
     let mut transport = build_transport_config(&config);
     transport.max_concurrent_bidi_streams(config.max_incoming_streams.try_into().unwrap());
