@@ -7,8 +7,9 @@ Rust implementation of sQUIC, wrapping [Quinn](https://github.com/quinn-rs/quinn
 1. **Silent server** — invisible to port scanners. Only clients with the server's public key can elicit a response.
 2. **No CA/PKI** — identity is a pinned Ed25519 public key (32 bytes). No certificate authorities.
 3. **Client whitelisting** — runtime-manageable set of allowed client keys. Non-whitelisted clients are silently dropped at the MAC layer.
-4. **Replay protection** — 120-second timestamp window in the MAC computation.
-5. **Interoperable** — same wire format as squic-go. Go server + Rust client (and vice versa) work together.
+4. **Persistent client identity** — optional `client_key` config for stable client identity across reconnects, enabling server-side whitelisting.
+5. **Replay protection** — 120-second timestamp window in the MAC computation.
+6. **Interoperable** — same wire format as squic-go. Go server + Rust client (and vice versa) work together.
 
 ## Install
 
