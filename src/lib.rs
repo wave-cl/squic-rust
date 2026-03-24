@@ -78,6 +78,10 @@ pub struct Config {
     pub initial_rtt: Option<Duration>,
     /// Allow 0-RTT resumption. Has replay attack implications. Default: false.
     pub enable_0rtt: bool,
+    /// Optional hex-encoded Ed25519 private key seed (64 hex chars).
+    /// When set, dial() uses this persistent identity instead of generating an ephemeral one.
+    /// The client's X25519 public key is derived from this for MAC1 and whitelist matching.
+    pub client_key: Option<String>,
 }
 
 impl Default for Config {
@@ -97,6 +101,7 @@ impl Default for Config {
             enable_datagrams: false,
             initial_rtt: None,
             enable_0rtt: false,
+            client_key: None,
         }
     }
 }
@@ -235,9 +240,23 @@ pub async fn dial(
     server_pub_key: &[u8; 32],
     config: Config,
 ) -> Result<quinn::Connection, Error> {
-    // Generate ephemeral client X25519 key pair
-    let client_x25519_priv = x25519_dalek::StaticSecret::random_from_rng(rand_core::OsRng);
-    let client_x25519_pub = X25519Public::from(&client_x25519_priv);
+    // Derive or generate X25519 key pair
+    let (client_x25519_priv, client_x25519_pub) = if let Some(ref key_hex) = config.client_key {
+        // Persistent client identity: derive X25519 from Ed25519 seed
+        let seed = hex::decode(key_hex).map_err(|e| Error::Tls(format!("invalid client_key hex: {e}")))?;
+        if seed.len() != 32 {
+            return Err(Error::Tls(format!("client_key must be 32 bytes (got {})", seed.len())));
+        }
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&seed.try_into().unwrap());
+        let x25519_priv = ed25519_private_to_x25519(&signing_key);
+        let x25519_pub = X25519Public::from(&x25519_priv);
+        (x25519_priv, x25519_pub)
+    } else {
+        // Ephemeral: random X25519 key pair
+        let priv_key = x25519_dalek::StaticSecret::random_from_rng(rand_core::OsRng);
+        let pub_key = X25519Public::from(&priv_key);
+        (priv_key, pub_key)
+    };
 
     // DH shared secret
     let server_x25519_pub = ed25519_public_to_x25519(server_pub_key)?;
