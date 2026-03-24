@@ -46,6 +46,15 @@ pub enum Error {
     InvalidKey(&'static str),
 }
 
+/// Congestion control algorithm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CongestionController {
+    /// CUBIC (default). Good general-purpose algorithm.
+    Cubic,
+    /// BBR. Better for bufferbloat and high-latency links.
+    Bbr,
+}
+
 /// Configuration for sQUIC connections.
 pub struct Config {
     /// Maximum idle timeout. Default: 30 seconds.
@@ -78,6 +87,8 @@ pub struct Config {
     pub initial_rtt: Option<Duration>,
     /// Disable active connection migration (RFC 9000 §9). Default: false.
     pub disable_active_migration: bool,
+    /// Congestion control algorithm. Default: Cubic.
+    pub congestion_controller: CongestionController,
     /// Optional hex-encoded Ed25519 private key seed (64 hex chars).
     /// When set, dial() uses this persistent identity instead of generating an ephemeral one.
     /// The client's X25519 public key is derived from this for MAC1 and whitelist matching.
@@ -101,6 +112,7 @@ impl Default for Config {
             enable_datagrams: false,
             initial_rtt: None,
             disable_active_migration: false,
+            congestion_controller: CongestionController::Cubic,
             client_key: None,
         }
     }
@@ -184,6 +196,12 @@ fn build_transport_config(config: &Config) -> quinn::TransportConfig {
     }
     if let Some(rtt) = config.initial_rtt {
         transport.initial_rtt(rtt);
+    }
+    match config.congestion_controller {
+        CongestionController::Bbr => {
+            transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
+        }
+        CongestionController::Cubic => {} // Quinn default
     }
     transport
 }
