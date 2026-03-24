@@ -76,6 +76,8 @@ pub struct Config {
     pub enable_datagrams: bool,
     /// Initial RTT estimate. Default: None (333ms).
     pub initial_rtt: Option<Duration>,
+    /// Allow 0-RTT resumption. Has replay attack implications. Default: false.
+    pub enable_0rtt: bool,
 }
 
 impl Default for Config {
@@ -94,6 +96,7 @@ impl Default for Config {
             disable_mtu_discovery: false,
             enable_datagrams: false,
             initial_rtt: None,
+            enable_0rtt: false,
         }
     }
 }
