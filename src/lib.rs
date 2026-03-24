@@ -78,8 +78,6 @@ pub struct Config {
     pub initial_rtt: Option<Duration>,
     /// Disable active connection migration (RFC 9000 §9). Default: false.
     pub disable_active_migration: bool,
-    /// Allow 0-RTT resumption. Has replay attack implications. Default: false.
-    pub enable_0rtt: bool,
     /// Optional hex-encoded Ed25519 private key seed (64 hex chars).
     /// When set, dial() uses this persistent identity instead of generating an ephemeral one.
     /// The client's X25519 public key is derived from this for MAC1 and whitelist matching.
@@ -103,7 +101,6 @@ impl Default for Config {
             enable_datagrams: false,
             initial_rtt: None,
             disable_active_migration: false,
-            enable_0rtt: false,
             client_key: None,
         }
     }
@@ -295,7 +292,14 @@ pub async fn dial(
     )?;
     endpoint.set_default_client_config(client_config);
 
-    let conn = endpoint.connect(addr, "squic")?.await?;
+    let handshake_timeout = config.handshake_timeout.unwrap_or(Duration::from_secs(10));
+    let connecting = endpoint.connect(addr, "squic")?;
+    let conn = tokio::time::timeout(handshake_timeout, connecting)
+        .await
+        .map_err(|_| Error::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("handshake timed out after {:?}", handshake_timeout),
+        )))??;
     Ok(conn)
 }
 
