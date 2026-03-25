@@ -1,4 +1,4 @@
-# sQUIC — Sovereign QUIC (Rust)
+# sQUIC — Shielded QUIC (Rust)
 
 Rust implementation of sQUIC, wrapping [Quinn](https://github.com/quinn-rs/quinn). Wire-compatible with [squic-go](https://github.com/wave-cl/squic-go).
 

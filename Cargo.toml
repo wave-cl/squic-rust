@@ -2,7 +2,7 @@
 name = "squic"
 version = "0.1.0"
 edition = "2024"
-description = "Sovereign QUIC: silent server, key-pinned identity, runtime client whitelisting"
+description = "Shielded QUIC: silent server, key-pinned identity, runtime client whitelisting"
 license = "MIT"
 
 [dependencies]
