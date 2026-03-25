@@ -9,7 +9,8 @@ Rust implementation of sQUIC, wrapping [Quinn](https://github.com/quinn-rs/quinn
 3. **Client whitelisting** — runtime-manageable set of allowed client keys. Non-whitelisted clients are silently dropped at the MAC layer.
 4. **Persistent client identity** — optional `client_key` config for stable client identity across reconnects, enabling server-side whitelisting.
 5. **Replay protection** — 120-second timestamp window in the MAC computation.
-6. **Interoperable** — same wire format as squic-go. Go server + Rust client (and vice versa) work together.
+6. **DDoS resistance** — WireGuard-style MAC2 + cookie mechanism. Under load, the server requires proof-of-address before performing expensive DH operations.
+7. **Interoperable** — same wire format as squic-go. Go server + Rust client (and vice versa) work together.
 
 ### Connection Modes
 
