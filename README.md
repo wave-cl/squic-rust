@@ -17,7 +17,6 @@ Rust implementation of sQUIC, wrapping [Quinn](https://github.com/quinn-rs/quinn
 |------|--------------|---------------|-----------|
 | **Open** | No `allowed_keys` | No `client_key` | Any client with the server's public key can connect. Default. |
 | **Whitelisted** | `allowed_keys` set | `client_key` set | Only clients whose keys are in the whitelist can connect. Silently dropped before any QUIC processing. |
-| **Identified** | No `allowed_keys` | `client_key` set | Any valid client can connect. Server can identify returning clients by their public key. |
 
 In all three modes, the server is silent to anyone who does not possess the server's public key.
 
