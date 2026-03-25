@@ -93,6 +93,9 @@ pub struct Config {
     /// When set, dial() uses this persistent identity instead of generating an ephemeral one.
     /// The client's X25519 public key is derived from this for MAC1 and whitelist matching.
     pub client_key: Option<String>,
+    /// DH operations per second before entering under-load mode (MAC2 required).
+    /// Default: 1000. Set to 0 to disable MAC2 protection.
+    pub load_threshold: Option<u64>,
 }
 
 impl Default for Config {
@@ -114,6 +117,7 @@ impl Default for Config {
             disable_active_migration: false,
             congestion_controller: CongestionController::Cubic,
             client_key: None,
+            load_threshold: None,
         }
     }
 }
@@ -220,7 +224,8 @@ pub async fn listen(
     let std_socket = create_udp_socket(addr)?;
     let socket = Arc::new(tokio::net::UdpSocket::from_std(std_socket).map_err(Error::Io)?);
 
-    let server_socket = ServerSocket::new(socket, server_x25519_priv, whitelist.clone());
+    let load_threshold = config.load_threshold.unwrap_or(1000);
+    let server_socket = ServerSocket::new(socket, server_x25519_priv, whitelist.clone(), load_threshold);
 
     let tls_config = tls::server_tls_config(signing_key, &config.alpn_protocols)?;
     let quic_server_config: quinn_proto::crypto::rustls::QuicServerConfig = tls_config

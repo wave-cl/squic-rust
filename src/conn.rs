@@ -1,14 +1,15 @@
 use crate::mac::{
-    compute_mac1, is_quic_initial, now_timestamp, timestamp_in_window, verify_mac1, MAC_OVERHEAD,
-    CLIENT_KEY_SIZE, TIMESTAMP_SIZE,
+    compute_mac1, compute_mac2, cookie_value, encrypt_cookie, is_quic_initial, now_timestamp,
+    timestamp_in_window, verify_mac1, verify_mac2, CLIENT_KEY_SIZE, COOKIE_REPLY_TYPE,
+    MAC_OVERHEAD, MAC_SIZE, TIMESTAMP_SIZE,
 };
 use crate::whitelist::Whitelist;
 use quinn::udp::{RecvMeta, Transmit, UdpSocketState};
 use quinn::AsyncUdpSocket;
 use std::io;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 use std::task::{Context, Poll};
 use tokio::io::Interest;
 use x25519_dalek::{PublicKey as X25519Public, StaticSecret as X25519Secret};
@@ -20,6 +21,12 @@ pub struct ServerSocket {
     inner: UdpSocketState,
     server_x25519_priv: X25519Secret,
     whitelist: Arc<Whitelist>,
+    // MAC2 + cookie DDoS protection
+    cookie_secret: RwLock<[u8; 32]>,
+    prev_cookie_secret: RwLock<[u8; 32]>,
+    under_load: AtomicBool,
+    dh_count: AtomicU64,
+    load_threshold: u64,
 }
 
 impl ServerSocket {
@@ -27,17 +34,27 @@ impl ServerSocket {
         socket: Arc<tokio::net::UdpSocket>,
         server_x25519_priv: X25519Secret,
         whitelist: Arc<Whitelist>,
+        load_threshold: u64,
     ) -> Self {
         let inner = UdpSocketState::new((&*socket).into()).expect("UdpSocketState::new");
+        let mut secret1 = [0u8; 32];
+        let mut secret2 = [0u8; 32];
+        rand::Fill::fill(&mut secret1, &mut rand::rng());
+        rand::Fill::fill(&mut secret2, &mut rand::rng());
         Self {
             io: socket,
             inner,
             server_x25519_priv,
             whitelist,
+            cookie_secret: RwLock::new(secret1),
+            prev_cookie_secret: RwLock::new(secret2),
+            under_load: AtomicBool::new(false),
+            dh_count: AtomicU64::new(0),
+            load_threshold: if load_threshold == 0 { 1000 } else { load_threshold },
         }
     }
 
-    fn validate_and_strip(&self, buf: &mut [u8], len: usize) -> Option<usize> {
+    fn validate_and_strip(&self, buf: &mut [u8], len: usize, addr: Option<SocketAddr>) -> Option<usize> {
         if !is_quic_initial(&buf[..len]) {
             return Some(len); // non-Initial passes through
         }
@@ -49,23 +66,58 @@ impl ServerSocket {
         let quic_len = len - MAC_OVERHEAD;
         let client_pub = &buf[quic_len..quic_len + CLIENT_KEY_SIZE];
         let ts_bytes = &buf[quic_len + CLIENT_KEY_SIZE..quic_len + CLIENT_KEY_SIZE + TIMESTAMP_SIZE];
-        let mac1 = &buf[quic_len + CLIENT_KEY_SIZE + TIMESTAMP_SIZE..len];
+        let mac1_start = quic_len + CLIENT_KEY_SIZE + TIMESTAMP_SIZE;
+        let mac1 = &buf[mac1_start..mac1_start + MAC_SIZE];
+        let mac2 = &buf[mac1_start + MAC_SIZE..len];
 
         let timestamp = u32::from_be_bytes([ts_bytes[0], ts_bytes[1], ts_bytes[2], ts_bytes[3]]);
 
-        // Step 1: Replay protection
+        // Step 1: Replay protection (cheap)
         if !timestamp_in_window(timestamp, now_timestamp()) {
             return None;
         }
 
-        // Step 2: Whitelist check (fast, before expensive DH)
+        // Step 2: MAC2 check — if under load, require valid MAC2
+        if self.under_load.load(Ordering::Relaxed) {
+            let is_zero = mac2.iter().all(|&b| b == 0);
+            let mut mac2_valid = false;
+
+            if !is_zero {
+                if let Some(a) = addr {
+                    let ip = a.ip();
+                    let data_before_mac2 = &buf[..mac1_start];
+                    let secret = *self.cookie_secret.read().unwrap();
+                    let cookie = cookie_value(&secret, ip);
+                    if verify_mac2(&cookie, data_before_mac2, mac1, mac2) {
+                        mac2_valid = true;
+                    } else {
+                        let prev = *self.prev_cookie_secret.read().unwrap();
+                        let cookie = cookie_value(&prev, ip);
+                        if verify_mac2(&cookie, data_before_mac2, mac1, mac2) {
+                            mac2_valid = true;
+                        }
+                    }
+                }
+            }
+
+            if !mac2_valid {
+                // Send cookie reply and drop
+                if let Some(a) = addr {
+                    self.send_cookie_reply(a);
+                }
+                return None;
+            }
+        }
+
+        // Step 3: Whitelist check (fast, before expensive DH)
         let mut key = [0u8; 32];
         key.copy_from_slice(client_pub);
         if !self.whitelist.is_allowed(&key) {
             return None;
         }
 
-        // Step 3: DH + MAC1 verification
+        // Step 4: DH + MAC1 verification (expensive)
+        self.dh_count.fetch_add(1, Ordering::Relaxed);
         let client_x25519 = X25519Public::from(key);
         let shared = self.server_x25519_priv.diffie_hellman(&client_x25519);
 
@@ -74,6 +126,17 @@ impl ServerSocket {
         }
 
         Some(quic_len)
+    }
+
+    fn send_cookie_reply(&self, addr: SocketAddr) {
+        let secret = *self.cookie_secret.read().unwrap();
+        let cookie = cookie_value(&secret, addr.ip());
+        if let Some(encrypted) = encrypt_cookie(&secret, &cookie) {
+            let mut reply = Vec::with_capacity(1 + encrypted.len());
+            reply.push(COOKIE_REPLY_TYPE);
+            reply.extend_from_slice(&encrypted);
+            let _ = self.io.try_send_to(&reply, addr);
+        }
     }
 }
 
@@ -113,7 +176,8 @@ impl AsyncUdpSocket for ServerSocket {
                 for i in 0..count {
                     let len = metas[i].len;
                     let buf = &mut bufs[i][..len];
-                    match self.validate_and_strip(buf, len) {
+                    let addr = Some(metas[i].addr);
+                    match self.validate_and_strip(buf, len, addr) {
                         Some(new_len) => {
                             metas[i].len = new_len;
                             valid += 1;
@@ -175,6 +239,7 @@ pub struct ClientSocket {
     shared_secret: [u8; 32],
     client_pub_key: [u8; 32],
     initial_sent: AtomicBool,
+    cookie: RwLock<Option<Vec<u8>>>, // stored cookie from server for MAC2
 }
 
 impl ClientSocket {
@@ -190,6 +255,7 @@ impl ClientSocket {
             shared_secret,
             client_pub_key,
             initial_sent: AtomicBool::new(false),
+            cookie: RwLock::new(None),
         }
     }
 }
@@ -210,17 +276,27 @@ impl AsyncUdpSocket for ClientSocket {
         if !self.initial_sent.load(Ordering::Relaxed) && is_quic_initial(transmit.contents) {
             self.initial_sent.store(true, Ordering::Relaxed);
             let ts = now_timestamp();
-            let mac = compute_mac1(&self.shared_secret, transmit.contents, ts);
+            let mac1 = compute_mac1(&self.shared_secret, transmit.contents, ts);
             let mut buf = Vec::with_capacity(transmit.contents.len() + MAC_OVERHEAD);
             buf.extend_from_slice(transmit.contents);
             buf.extend_from_slice(&self.client_pub_key);
             buf.extend_from_slice(&ts.to_be_bytes());
-            buf.extend_from_slice(&mac);
+            buf.extend_from_slice(&mac1);
+
+            // MAC2: zeros if no cookie, computed if cookie available
+            let cookie = self.cookie.read().unwrap();
+            if let Some(ref c) = *cookie {
+                let mac2 = compute_mac2(c, &buf[..buf.len()], &mac1);
+                buf.extend_from_slice(&mac2);
+            } else {
+                buf.extend_from_slice(&[0u8; 16]); // MAC2 = zeros
+            }
+
             let new_transmit = Transmit {
                 destination: transmit.destination,
                 ecn: transmit.ecn,
                 contents: &buf,
-                segment_size: None, // Initial is a single packet; disable GSO to avoid size mismatch from MAC1 overhead
+                segment_size: None,
                 src_ip: transmit.src_ip,
             };
             self.io.try_io(Interest::WRITABLE, || {
@@ -241,10 +317,37 @@ impl AsyncUdpSocket for ClientSocket {
     ) -> Poll<io::Result<usize>> {
         loop {
             ready!(self.io.poll_recv_ready(cx))?;
-            if let Ok(res) = self.io.try_io(Interest::READABLE, || {
+            if let Ok(count) = self.io.try_io(Interest::READABLE, || {
                 self.inner.recv((&*self.io).into(), bufs, metas)
             }) {
-                return Poll::Ready(Ok(res));
+                // Check for cookie replies — store them, mark for removal
+                let mut is_cookie = vec![false; count];
+                for i in 0..count {
+                    let len = metas[i].len;
+                    if len > 0 && bufs[i][0] == COOKIE_REPLY_TYPE {
+                        let cookie_data = bufs[i][1..len].to_vec();
+                        *self.cookie.write().unwrap() = Some(cookie_data);
+                        is_cookie[i] = true;
+                    }
+                }
+                // Compact non-cookie packets
+                let mut valid = 0;
+                for i in 0..count {
+                    if is_cookie[i] {
+                        continue;
+                    }
+                    if valid != i {
+                        metas[valid] = metas[i];
+                        let src_len = metas[valid].len;
+                        let (left, right) = bufs.split_at_mut(i);
+                        left[valid][..src_len].copy_from_slice(&right[0][..src_len]);
+                    }
+                    valid += 1;
+                }
+                if valid == 0 {
+                    continue; // all were cookie replies, poll again
+                }
+                return Poll::Ready(Ok(valid));
             }
         }
     }
