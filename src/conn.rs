@@ -1,7 +1,7 @@
 use crate::mac::{
-    compute_mac1, compute_mac2, cookie_value, encrypt_cookie, is_quic_initial, now_timestamp,
-    timestamp_in_window, verify_mac1, verify_mac2, CLIENT_KEY_SIZE, COOKIE_REPLY_TYPE,
-    MAC_OVERHEAD, MAC_SIZE, TIMESTAMP_SIZE,
+    compute_mac1, compute_mac2, cookie_value, encrypt_cookie, generate_nonce, is_quic_initial,
+    now_timestamp, timestamp_in_window, verify_mac1, verify_mac2, CLIENT_KEY_SIZE,
+    COOKIE_REPLY_TYPE, MAC_OVERHEAD, MAC_SIZE, NONCE_SIZE, TIMESTAMP_SIZE,
 };
 use crate::whitelist::Whitelist;
 use quinn::udp::{RecvMeta, Transmit, UdpSocketState};
@@ -39,8 +39,8 @@ impl ServerSocket {
         let inner = UdpSocketState::new((&*socket).into()).expect("UdpSocketState::new");
         let mut secret1 = [0u8; 32];
         let mut secret2 = [0u8; 32];
-        rand::Fill::fill(&mut secret1, &mut rand::rng());
-        rand::Fill::fill(&mut secret2, &mut rand::rng());
+        getrandom::fill(&mut secret1).expect("getrandom failed");
+        getrandom::fill(&mut secret2).expect("getrandom failed");
         Self {
             io: socket,
             inner,
@@ -64,11 +64,17 @@ impl ServerSocket {
         }
 
         let quic_len = len - MAC_OVERHEAD;
-        let client_pub = &buf[quic_len..quic_len + CLIENT_KEY_SIZE];
-        let ts_bytes = &buf[quic_len + CLIENT_KEY_SIZE..quic_len + CLIENT_KEY_SIZE + TIMESTAMP_SIZE];
-        let mac1_start = quic_len + CLIENT_KEY_SIZE + TIMESTAMP_SIZE;
-        let mac1 = &buf[mac1_start..mac1_start + MAC_SIZE];
-        let mac2 = &buf[mac1_start + MAC_SIZE..len];
+        let mut off = quic_len;
+        let client_pub = &buf[off..off + CLIENT_KEY_SIZE];
+        off += CLIENT_KEY_SIZE;
+        let ts_bytes = &buf[off..off + TIMESTAMP_SIZE];
+        off += TIMESTAMP_SIZE;
+        let nonce = &buf[off..off + NONCE_SIZE];
+        off += NONCE_SIZE;
+        let mac1_start = off;
+        let mac1 = &buf[off..off + MAC_SIZE];
+        off += MAC_SIZE;
+        let mac2 = &buf[off..len];
 
         let timestamp = u32::from_be_bytes([ts_bytes[0], ts_bytes[1], ts_bytes[2], ts_bytes[3]]);
 
@@ -121,7 +127,7 @@ impl ServerSocket {
         let client_x25519 = X25519Public::from(key);
         let shared = self.server_x25519_priv.diffie_hellman(&client_x25519);
 
-        if !verify_mac1(shared.as_bytes(), &buf[..quic_len], timestamp, mac1) {
+        if !verify_mac1(shared.as_bytes(), &buf[..quic_len], timestamp, nonce, mac1) {
             return None;
         }
 
@@ -276,11 +282,13 @@ impl AsyncUdpSocket for ClientSocket {
         if !self.initial_sent.load(Ordering::Relaxed) && is_quic_initial(transmit.contents) {
             self.initial_sent.store(true, Ordering::Relaxed);
             let ts = now_timestamp();
-            let mac1 = compute_mac1(&self.shared_secret, transmit.contents, ts);
+            let nonce = generate_nonce();
+            let mac1 = compute_mac1(&self.shared_secret, transmit.contents, ts, &nonce);
             let mut buf = Vec::with_capacity(transmit.contents.len() + MAC_OVERHEAD);
             buf.extend_from_slice(transmit.contents);
             buf.extend_from_slice(&self.client_pub_key);
             buf.extend_from_slice(&ts.to_be_bytes());
+            buf.extend_from_slice(&nonce);
             buf.extend_from_slice(&mac1);
 
             // MAC2: zeros if no cookie, computed if cookie available
