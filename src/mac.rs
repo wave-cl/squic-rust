@@ -23,6 +23,11 @@ pub const NONCE_SIZE: usize = 8;
 /// 32-byte client X25519 public key + 4-byte timestamp + 8-byte nonce + 16-byte MAC1 + 16-byte MAC2.
 pub const MAC_OVERHEAD: usize = CLIENT_KEY_SIZE + TIMESTAMP_SIZE + NONCE_SIZE + MAC_SIZE + MAC2_SIZE;
 
+// Static assertion: MAC_OVERHEAD must be 76 bytes (32+4+8+16+16).
+// If this changes, update ClientSocket::try_send() which bypasses quinn-udp
+// for the oversized Initial packet to avoid GSO issues on Linux.
+const _: () = assert!(MAC_OVERHEAD == 76, "MAC_OVERHEAD changed — update Initial send path in conn.rs");
+
 /// First byte of a cookie reply packet.
 pub const COOKIE_REPLY_TYPE: u8 = 0x01;
 

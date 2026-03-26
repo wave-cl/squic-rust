@@ -300,15 +300,13 @@ impl AsyncUdpSocket for ClientSocket {
                 buf.extend_from_slice(&[0u8; 16]); // MAC2 = zeros
             }
 
-            let new_transmit = Transmit {
-                destination: transmit.destination,
-                ecn: transmit.ecn,
-                contents: &buf,
-                segment_size: None,
-                src_ip: transmit.src_ip,
-            };
+            // Bypass quinn-udp's GSO logic for the oversized Initial packet.
+            // On Linux with GSO enabled, segment_size: None is ambiguous and
+            // quinn-udp may silently fail to send the 1276-byte packet.
+            // Send the raw datagram directly, matching Go's WriteMsgUDP approach.
             self.io.try_io(Interest::WRITABLE, || {
-                self.inner.send((&*self.io).into(), &new_transmit)
+                (&*self.io).try_send_to(&buf, transmit.destination)
+                    .map(|_| ())
             })
         } else {
             self.io.try_io(Interest::WRITABLE, || {

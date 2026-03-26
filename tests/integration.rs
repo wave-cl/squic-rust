@@ -210,3 +210,60 @@ async fn test_enable_whitelist_with_keys() {
 
 // MAC and timestamp tests are in the unit test modules.
 // These integration tests focus on the full network stack.
+
+/// Regression test: Initial packet must arrive despite being oversized (1200 + 76 = 1276 bytes).
+/// On Linux with GSO enabled, quinn-udp previously silently dropped the oversized packet
+/// when segment_size was set to None. The fix bypasses quinn-udp for Initial packets.
+/// If this test times out, the Initial send bypass is broken.
+#[tokio::test]
+async fn test_initial_packet_arrives_fast() {
+    let (listener, _key, pub_key) = start_server(Config::default()).await;
+    let addr = listener.local_addr().unwrap();
+
+    let server_task = tokio::spawn(async move {
+        let incoming = listener.accept().await.unwrap();
+        let conn = incoming.await.unwrap();
+        let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+        let mut buf = vec![0u8; 16];
+        let n = recv.read(&mut buf).await.unwrap().unwrap();
+        send.write_all(&buf[..n]).await.unwrap();
+        send.finish().unwrap();
+        // Wait for client to finish reading before dropping connection
+        let _ = recv.read(&mut buf).await;
+        // Keep connection alive briefly
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    });
+
+    // Handshake must complete within 3 seconds.
+    // The original bug caused an indefinite hang here.
+    let conn = tokio::time::timeout(
+        Duration::from_secs(3),
+        squic::dial(addr, &pub_key, Config::default()),
+    )
+    .await
+    .expect("handshake timed out — Initial packet likely dropped (GSO regression)")
+    .expect("dial failed");
+
+    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    send.write_all(b"ping").await.unwrap();
+    send.finish().unwrap();
+    let mut buf = vec![0u8; 16];
+    let n = recv.read(&mut buf).await.unwrap().unwrap();
+    assert_eq!(&buf[..n], b"ping");
+
+    let _ = server_task.await;
+}
+
+/// Verify MAC_OVERHEAD is the expected 76 bytes at runtime.
+#[test]
+fn test_mac_overhead_is_76() {
+    assert_eq!(squic::mac::MAC_OVERHEAD, 76);
+    assert_eq!(
+        squic::mac::MAC_OVERHEAD,
+        squic::mac::CLIENT_KEY_SIZE
+            + squic::mac::TIMESTAMP_SIZE
+            + squic::mac::NONCE_SIZE
+            + squic::mac::MAC_SIZE
+            + squic::mac::MAC2_SIZE,
+    );
+}
