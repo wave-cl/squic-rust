@@ -245,6 +245,7 @@ pub struct ClientSocket {
     shared_secret: [u8; 32],
     client_pub_key: [u8; 32],
     initial_sent: AtomicBool,
+    handshake_done: AtomicBool, // true after first non-cookie packet received; skips all checks
     cookie: RwLock<Option<Vec<u8>>>, // stored cookie from server for MAC2
 }
 
@@ -261,6 +262,7 @@ impl ClientSocket {
             shared_secret,
             client_pub_key,
             initial_sent: AtomicBool::new(false),
+            handshake_done: AtomicBool::new(false),
             cookie: RwLock::new(None),
         }
     }
@@ -279,6 +281,13 @@ impl AsyncUdpSocket for ClientSocket {
     }
 
     fn try_send(&self, transmit: &Transmit) -> io::Result<()> {
+        // Fast path: after handshake, all packets go directly to quinn-udp
+        if self.handshake_done.load(Ordering::Relaxed) {
+            return self.io.try_io(Interest::WRITABLE, || {
+                self.inner.send((&*self.io).into(), transmit)
+            });
+        }
+
         if !self.initial_sent.load(Ordering::Relaxed) && is_quic_initial(transmit.contents) {
             self.initial_sent.store(true, Ordering::Relaxed);
             let ts = now_timestamp();
@@ -341,16 +350,30 @@ impl AsyncUdpSocket for ClientSocket {
             if let Ok(count) = self.io.try_io(Interest::READABLE, || {
                 self.inner.recv((&*self.io).into(), bufs, metas)
             }) {
+                // Fast path: after handshake, no cookie replies possible
+                if self.handshake_done.load(Ordering::Relaxed) {
+                    return Poll::Ready(Ok(count));
+                }
+
                 // Check for cookie replies — store them, mark for removal
-                let mut is_cookie = vec![false; count];
+                let mut is_cookie = [false; 64]; // stack array, max GRO batch size
+                let mut any_cookie = false;
                 for i in 0..count {
                     let len = metas[i].len;
                     if len > 0 && bufs[i][0] == COOKIE_REPLY_TYPE {
                         let cookie_data = bufs[i][1..len].to_vec();
                         *self.cookie.write().unwrap() = Some(cookie_data);
                         is_cookie[i] = true;
+                        any_cookie = true;
                     }
                 }
+
+                // If no cookies in this batch, handshake is done — set fast path
+                if !any_cookie {
+                    self.handshake_done.store(true, Ordering::Relaxed);
+                    return Poll::Ready(Ok(count));
+                }
+
                 // Compact non-cookie packets
                 let mut valid = 0;
                 for i in 0..count {
