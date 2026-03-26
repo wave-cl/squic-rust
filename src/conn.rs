@@ -300,10 +300,25 @@ impl AsyncUdpSocket for ClientSocket {
                 buf.extend_from_slice(&[0u8; 16]); // MAC2 = zeros
             }
 
-            // Bypass quinn-udp's GSO logic for the oversized Initial packet.
-            // On Linux with GSO enabled, segment_size: None is ambiguous and
-            // quinn-udp may silently fail to send the 1276-byte packet.
-            // Send the raw datagram directly, matching Go's WriteMsgUDP approach.
+            // PERF NOTE: We bypass quinn-udp's UdpSocketState::send() here and
+            // send the Initial packet as a raw datagram via try_send_to().
+            //
+            // Why: The Initial packet is 1276 bytes (1200 QUIC + 76 MAC overhead),
+            // which exceeds Quinn's normal 1200-byte segment size. On Linux with
+            // GSO (Generic Segmentation Offload) enabled, quinn-udp's send() with
+            // segment_size: None is ambiguous — it may attempt to segment the packet
+            // at 1200 bytes, silently dropping it. This caused the Rust client to
+            // hang indefinitely during handshake on Linux VPS.
+            //
+            // Trade-off: This single Initial packet misses GSO, ECN marking, and
+            // sendmmsg batching from quinn-udp. This is acceptable because:
+            // 1. Initial packets are sent once per connection (not on the hot path)
+            // 2. All subsequent 1-RTT data packets go through quinn-udp normally
+            // 3. The Go client uses the same raw-send approach (WriteMsgUDP)
+            //
+            // If MAC_OVERHEAD changes, the static assertion in mac.rs will fail at
+            // compile time. If the overhead is ever reduced to fit within 1200 bytes,
+            // this bypass can be removed and the packet sent through quinn-udp.
             self.io.try_io(Interest::WRITABLE, || {
                 (&*self.io).try_send_to(&buf, transmit.destination)
                     .map(|_| ())
