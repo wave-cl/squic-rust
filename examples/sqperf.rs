@@ -1,8 +1,9 @@
 use clap::Parser;
 use squic::{self, Config};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[derive(Parser)]
 #[command(name = "sqperf", about = "sQUIC throughput benchmark")]
@@ -111,6 +112,7 @@ async fn handle_connection(conn: quinn::Connection) -> Result<(), Box<dyn std::e
                 b'U' => {
                     // Upload: receive data, report total
                     let mut total = 0u64;
+                    let mut last_total = 0u64;
                     let mut buf = vec![0u8; 32768];
                     let start = Instant::now();
                     let mut last_report = start;
@@ -122,9 +124,12 @@ async fn handle_connection(conn: quinn::Connection) -> Result<(), Box<dyn std::e
                                 let now = Instant::now();
                                 if now.duration_since(last_report) >= Duration::from_secs(1) {
                                     let elapsed = now.duration_since(start).as_secs_f64();
-                                    let mbps = (total as f64 * 8.0) / elapsed / 1_000_000.0;
-                                    eprintln!("  Server: {:.0} MB in {:.0}s ({:.1} Mbps)",
-                                        total as f64 / 1_048_576.0, elapsed, mbps);
+                                    let delta = total - last_total;
+                                    last_total = total;
+                                    let mbps = delta as f64 * 8.0 / 1_000_000.0;
+                                    eprintln!("  Server: {:.0} MB total in {:.0}s (+{} MB, {:.1} Mbps)",
+                                        total as f64 / 1_048_576.0, elapsed,
+                                        delta / 1_048_576, mbps);
                                     last_report = now;
                                 }
                             }
@@ -205,13 +210,32 @@ async fn run_upload(
 
     let buf = vec![0xCDu8; 32768];
     let start = Instant::now();
-    let mut total = 0u64;
+    let total = Arc::new(AtomicU64::new(0));
+
+    // Per-second progress reporter
+    let total_ref = total.clone();
+    let progress = tokio::spawn(async move {
+        let mut last_total = 0u64;
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        interval.tick().await; // skip first immediate tick
+        loop {
+            interval.tick().await;
+            let t = total_ref.load(Ordering::Relaxed);
+            let delta = t - last_total;
+            last_total = t;
+            let elapsed = start.elapsed().as_secs_f64();
+            let mbps = delta as f64 * 8.0 / 1_000_000.0;
+            eprintln!("[  0]  {:.0}-{:.0}s  {} MB  {:.1} Mbits/sec  send",
+                elapsed - 1.0, elapsed, delta / 1_048_576, mbps);
+        }
+    });
 
     while start.elapsed() < duration {
         send.write_all(&buf).await?;
-        total += buf.len() as u64;
+        total.fetch_add(buf.len() as u64, Ordering::Relaxed);
     }
     send.finish()?;
+    progress.abort();
 
     // Read server-confirmed bytes (text format, matches Go sqperf)
     let mut server_buf = vec![0u8; 64];
@@ -223,7 +247,7 @@ async fn run_upload(
 
     let elapsed = start.elapsed().as_secs_f64();
     eprintln!("  server confirmed: {} bytes", confirmed);
-    Ok((total, elapsed))
+    Ok((total.load(Ordering::Relaxed), elapsed))
 }
 
 async fn run_download(
@@ -236,15 +260,34 @@ async fn run_download(
 
     let mut buf = vec![0u8; 32768];
     let start = Instant::now();
-    let mut total = 0u64;
+    let total = Arc::new(AtomicU64::new(0));
+
+    // Per-second progress reporter
+    let total_ref = total.clone();
+    let progress = tokio::spawn(async move {
+        let mut last_total = 0u64;
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            let t = total_ref.load(Ordering::Relaxed);
+            let delta = t - last_total;
+            last_total = t;
+            let elapsed = start.elapsed().as_secs_f64();
+            let mbps = delta as f64 * 8.0 / 1_000_000.0;
+            eprintln!("[  0]  {:.0}-{:.0}s  {} MB  {:.1} Mbits/sec  recv",
+                elapsed - 1.0, elapsed, delta / 1_048_576, mbps);
+        }
+    });
 
     while start.elapsed() < duration {
         match recv.read(&mut buf).await? {
-            Some(n) => total += n as u64,
+            Some(n) => { total.fetch_add(n as u64, Ordering::Relaxed); }
             None => break,
         }
     }
+    progress.abort();
 
     let elapsed = start.elapsed().as_secs_f64();
-    Ok((total, elapsed))
+    Ok((total.load(Ordering::Relaxed), elapsed))
 }
