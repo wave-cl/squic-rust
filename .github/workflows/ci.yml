@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      # ring builds from source, so an uncached run is slow enough to
+      # discourage anyone from waiting on it.
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo test --workspace
+
+      # Not -D warnings yet: this tree carries pre-existing warnings, and
+      # failing every build from the first commit would just get CI ignored.
+      # The count stays visible in the log; the flag goes on once it reaches
+      # zero.
+      - name: Clippy
+        run: cargo clippy --all-targets
