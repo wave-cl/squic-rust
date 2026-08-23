@@ -1,0 +1,15 @@
+/target
+
+# macOS
+.DS_Store
+
+# JetBrains
+/.idea
+
+# Editor and tooling leftovers
+*.rs.bk
+*.swp
+*~
+
+# Never commit private keys: squic identities are hex Ed25519 seeds
+*.key
