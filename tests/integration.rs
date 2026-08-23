@@ -267,3 +267,43 @@ fn test_mac_overhead_is_76() {
             + squic::mac::MAC2_SIZE,
     );
 }
+
+/// A client must be able to dial an IPv6 server.
+///
+/// `dial` used to bind `0.0.0.0:0` whatever the peer looked like, and quinn
+/// refuses a remote whose address family does not match its endpoint — so
+/// every IPv6 server was unreachable with "invalid remote address", before a
+/// packet was sent. Loopback is enough to catch that: it is the family of the
+/// socket that matters, not the route.
+#[tokio::test]
+async fn test_ipv6_connection() {
+    let (signing_key, pub_key) = squic::generate_keypair();
+    let addr: SocketAddr = "[::1]:0".parse().unwrap();
+    let listener = squic::listen(addr, &signing_key, Config::default())
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    assert!(addr.is_ipv6(), "expected an IPv6 listener, got {addr}");
+
+    let server_task = tokio::spawn(async move {
+        let incoming = listener.accept().await.unwrap();
+        let conn = incoming.await.unwrap();
+        let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+        let mut buf = vec![0u8; 1024];
+        let n = recv.read(&mut buf).await.unwrap().unwrap();
+        send.write_all(&buf[..n]).await.unwrap();
+        send.finish().unwrap();
+        let _ = send.stopped().await;
+    });
+
+    let conn = squic::dial(addr, &pub_key, Config::default()).await.unwrap();
+    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    send.write_all(b"hello over v6").await.unwrap();
+    send.finish().unwrap();
+
+    let mut buf = vec![0u8; 1024];
+    let n = recv.read(&mut buf).await.unwrap().unwrap();
+    assert_eq!(&buf[..n], b"hello over v6");
+
+    server_task.await.unwrap();
+}

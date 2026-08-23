@@ -7,7 +7,7 @@ pub mod whitelist;
 use conn::{ClientSocket, ServerSocket};
 use crypto::{ed25519_private_to_x25519, ed25519_public_to_x25519, x25519};
 use ed25519_dalek::SigningKey;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use whitelist::Whitelist;
@@ -287,7 +287,15 @@ pub async fn dial(
     let server_x25519_pub = ed25519_public_to_x25519(server_pub_key)?;
     let shared = x25519(&client_x25519_priv, &server_x25519_pub);
 
-    let bind_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
+    // Bind in the same family as the peer. Quinn refuses a remote whose
+    // address family does not match its endpoint, so a socket bound to
+    // 0.0.0.0 cannot dial an IPv6 server at all — it fails with "invalid
+    // remote address" before a packet is sent.
+    let bind_addr = if addr.is_ipv6() {
+        SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0))
+    } else {
+        SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
+    };
     let std_socket = create_udp_socket(bind_addr)?;
     let socket = Arc::new(tokio::net::UdpSocket::from_std(std_socket).map_err(Error::Io)?);
 
