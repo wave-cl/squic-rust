@@ -330,6 +330,9 @@ pub struct ClientSocket {
     cookie_key: [u8; 32], // decrypts cookie replies; derived from the server's public key
     handshake_done: AtomicBool, // true after first non-cookie packet received; skips the cookie scan
     cookie: RwLock<Option<[u8; 16]>>, // decrypted cookie from the server, keys MAC2
+    // The most recent Initial datagram and where it went, so a cookie
+    // challenge can be answered immediately rather than at the next PTO.
+    last_initial: RwLock<Option<(Vec<u8>, SocketAddr)>>,
 }
 
 impl ClientSocket {
@@ -348,6 +351,7 @@ impl ClientSocket {
             cookie_key,
             handshake_done: AtomicBool::new(false),
             cookie: RwLock::new(None),
+            last_initial: RwLock::new(None),
         }
     }
 }
@@ -369,6 +373,7 @@ impl ClientSocket {
     fn send_initial(&self, datagram: &[u8], destination: SocketAddr) -> io::Result<()> {
         let cookie = *self.cookie.read().unwrap();
         let buf = self.build_initial(datagram, cookie.as_ref());
+        *self.last_initial.write().unwrap() = Some((datagram.to_vec(), destination));
 
         // PERF NOTE: We bypass quinn-udp's UdpSocketState::send() here and
         // send the Initial packet as a raw datagram via try_send_to().
@@ -390,7 +395,7 @@ impl ClientSocket {
         // compile time. If the overhead is ever reduced to fit within 1200 bytes,
         // this bypass can be removed and the packet sent through quinn-udp.
         self.io.try_io(Interest::WRITABLE, || {
-            (&*self.io).try_send_to(&buf, destination).map(|_| ())
+            self.io.try_send_to(&buf, destination).map(|_| ())
         })
     }
 
@@ -407,10 +412,33 @@ impl ClientSocket {
         match <[u8; 16]>::try_from(plain.as_slice()) {
             Ok(c) => {
                 *self.cookie.write().unwrap() = Some(c);
+                self.answer_challenge(&c);
                 true
             }
             Err(_) => false,
         }
+    }
+
+    /// Re-send the last Initial straight away, now carrying MAC2.
+    ///
+    /// Quinn never sees a cookie reply — poll_recv strips them out — so left to
+    /// itself it would not retransmit until its next PTO, roughly a second. The
+    /// challenge is answerable immediately and waiting costs the caller a full
+    /// second per challenge, so answer it here. WireGuard does the same.
+    ///
+    /// Replaying the datagram is sound. The server dropped the original at the
+    /// MAC2 gate before quinn ever saw it, so this is the first time that packet
+    /// number reaches the peer; in the case where it did get through (under-load
+    /// cleared in between) quinn discards the duplicate. Only the sQUIC envelope
+    /// is rebuilt — fresh timestamp, nonce and MAC1 — never the QUIC packet.
+    fn answer_challenge(&self, cookie: &[u8; 16]) {
+        let Some((datagram, destination)) = self.last_initial.read().unwrap().clone() else {
+            return; // nothing sent yet; the next Initial will carry the cookie
+        };
+        let buf = self.build_initial(&datagram, Some(cookie));
+        let _ = self.io.try_io(Interest::WRITABLE, || {
+            self.io.try_send_to(&buf, destination).map(|_| ())
+        });
     }
 
     /// Build one Initial datagram plus its MAC envelope.

@@ -403,11 +403,10 @@ async fn test_cookie_challenge_admits_a_legitimate_client() {
     let addr = listener.local_addr().unwrap();
     let listener = std::sync::Arc::new(listener);
 
-    // Under load before the first packet arrives. The load monitor re-evaluates
-    // once a second, so the client's retransmission — the packet that actually
-    // carries MAC2 — has to get there inside that window. A short initial RTT
-    // pulls the PTO down to a few hundred milliseconds and makes this
-    // deterministic rather than a race against the monitor.
+    // Under load before the first packet arrives. The client answers the
+    // challenge as soon as it lands rather than waiting for a PTO, so this
+    // completes in about a round trip and needs no help from a shortened
+    // initial_rtt to fit inside the monitor's one-second window.
     listener.set_under_load(true);
 
     let accepting = listener.clone();
@@ -420,7 +419,6 @@ async fn test_cookie_challenge_admits_a_legitimate_client() {
     });
 
     let config = Config {
-        initial_rtt: Some(Duration::from_millis(50)),
         handshake_timeout: Some(Duration::from_secs(10)),
         ..Config::default()
     };
@@ -439,9 +437,13 @@ async fn test_cookie_challenge_admits_a_legitimate_client() {
         stats.mac2_verified >= 1,
         "the client's MAC2 never verified — the exchange did not complete: {stats:?}"
     );
+    // A PTO-driven answer takes ~1s on loopback; answering on receipt takes a
+    // round trip. Anything approaching a second means the immediate
+    // retransmission regressed and quinn's timer is doing the work again.
     assert!(
-        elapsed < Duration::from_secs(1),
-        "cookie exchange took {elapsed:?}, longer than the monitor window it has to fit inside"
+        elapsed < Duration::from_millis(300),
+        "cookie exchange took {elapsed:?}; expected roughly one RTT, so the \
+         challenge is being answered by a PTO rather than on receipt"
     );
 }
 
