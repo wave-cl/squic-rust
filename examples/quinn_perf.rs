@@ -108,11 +108,8 @@ async fn handle_connection(conn: quinn::Connection) -> Result<(), Box<dyn std::e
                 b'U' => {
                     let mut total = 0u64;
                     let mut buf = vec![0u8; 32768];
-                    loop {
-                        match recv.read(&mut buf).await {
-                            Ok(Some(n)) => total += n as u64,
-                            _ => break,
-                        }
+                    while let Ok(Some(n)) = recv.read(&mut buf).await {
+                        total += n as u64;
                     }
                     let _ = send.write_all(total.to_string().as_bytes()).await;
                     let _ = send.finish();

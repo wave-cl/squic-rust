@@ -95,12 +95,10 @@ mod tests {
         let client_x25519_priv = ed25519_private_to_x25519(&client_sign);
 
         let server_x25519_pub = ed25519_public_to_x25519(&server_pub).unwrap();
-        let client_x25519_pub = X25519Public::from(client_x25519_priv.diffie_hellman(&server_x25519_pub).to_bytes());
-        // Actually we need the client's X25519 public key from their private
-        let client_x25519_pub_real = x25519_dalek::PublicKey::from(&client_x25519_priv);
+        let client_x25519_pub = x25519_dalek::PublicKey::from(&client_x25519_priv);
 
         let shared_client = x25519(&client_x25519_priv, &server_x25519_pub);
-        let shared_server = x25519(&server_x25519_priv, &client_x25519_pub_real);
+        let shared_server = x25519(&server_x25519_priv, &client_x25519_pub);
         assert_eq!(shared_client, shared_server);
     }
 }

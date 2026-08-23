@@ -22,12 +22,12 @@ fn create_udp_socket(addr: SocketAddr) -> std::result::Result<std::net::UdpSocke
         socket2::Domain::IPV4
     };
     let sock = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))
-        .map_err(|e| Error::Io(e))?;
+        .map_err(Error::Io)?;
     // 2MB buffers — critical on Linux where defaults are ~160KB
     let _ = sock.set_recv_buffer_size(2 * 1024 * 1024);
     let _ = sock.set_send_buffer_size(2 * 1024 * 1024);
-    sock.set_nonblocking(true).map_err(|e| Error::Io(e))?;
-    sock.bind(&addr.into()).map_err(|e| Error::Io(e))?;
+    sock.set_nonblocking(true).map_err(Error::Io)?;
+    sock.bind(&addr.into()).map_err(Error::Io)?;
     Ok(sock.into())
 }
 

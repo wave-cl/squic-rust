@@ -82,7 +82,7 @@ pub fn now_timestamp() -> u32 {
 /// Check if a timestamp is within the replay window.
 pub fn timestamp_in_window(timestamp: u32, now: u32) -> bool {
     let diff = now as i64 - timestamp as i64;
-    diff >= -REPLAY_WINDOW && diff <= REPLAY_WINDOW
+    (-REPLAY_WINDOW..=REPLAY_WINDOW).contains(&diff)
 }
 
 /// Constant-time byte comparison.

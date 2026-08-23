@@ -1,7 +1,6 @@
-use squic::{self, Config, Error};
+use squic::{self, Config};
 use std::net::SocketAddr;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Helper: start a server and return (listener, public key hex).
 async fn start_server(

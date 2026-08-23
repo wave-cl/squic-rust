@@ -103,20 +103,20 @@ impl ServerSocket {
             let is_zero = mac2.iter().all(|&b| b == 0);
             let mut mac2_valid = false;
 
-            if !is_zero {
-                if let Some(a) = addr {
-                    let ip = a.ip();
-                    let data_before_mac2 = &buf[..mac1_start];
-                    let secret = *self.cookie_secret.read().unwrap();
-                    let cookie = cookie_value(&secret, ip);
+            if !is_zero
+                && let Some(a) = addr
+            {
+                let ip = a.ip();
+                let data_before_mac2 = &buf[..mac1_start];
+                let secret = *self.cookie_secret.read().unwrap();
+                let cookie = cookie_value(&secret, ip);
+                if verify_mac2(&cookie, data_before_mac2, mac1, mac2) {
+                    mac2_valid = true;
+                } else {
+                    let prev = *self.prev_cookie_secret.read().unwrap();
+                    let cookie = cookie_value(&prev, ip);
                     if verify_mac2(&cookie, data_before_mac2, mac1, mac2) {
                         mac2_valid = true;
-                    } else {
-                        let prev = *self.prev_cookie_secret.read().unwrap();
-                        let cookie = cookie_value(&prev, ip);
-                        if verify_mac2(&cookie, data_before_mac2, mac1, mac2) {
-                            mac2_valid = true;
-                        }
                     }
                 }
             }

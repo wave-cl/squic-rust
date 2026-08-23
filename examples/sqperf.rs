@@ -117,23 +117,18 @@ async fn handle_connection(conn: quinn::Connection) -> Result<(), Box<dyn std::e
                     let start = Instant::now();
                     let mut last_report = start;
 
-                    loop {
-                        match recv.read(&mut buf).await {
-                            Ok(Some(n)) => {
-                                total += n as u64;
-                                let now = Instant::now();
-                                if now.duration_since(last_report) >= Duration::from_secs(1) {
-                                    let elapsed = now.duration_since(start).as_secs_f64();
-                                    let delta = total - last_total;
-                                    last_total = total;
-                                    let mbps = delta as f64 * 8.0 / 1_000_000.0;
-                                    eprintln!("  Server: {:.0} MB total in {:.0}s (+{} MB, {:.1} Mbps)",
-                                        total as f64 / 1_048_576.0, elapsed,
-                                        delta / 1_048_576, mbps);
-                                    last_report = now;
-                                }
-                            }
-                            _ => break,
+                    while let Ok(Some(n)) = recv.read(&mut buf).await {
+                        total += n as u64;
+                        let now = Instant::now();
+                        if now.duration_since(last_report) >= Duration::from_secs(1) {
+                            let elapsed = now.duration_since(start).as_secs_f64();
+                            let delta = total - last_total;
+                            last_total = total;
+                            let mbps = delta as f64 * 8.0 / 1_000_000.0;
+                            eprintln!("  Server: {:.0} MB total in {:.0}s (+{} MB, {:.1} Mbps)",
+                                total as f64 / 1_048_576.0, elapsed,
+                                delta / 1_048_576, mbps);
+                            last_report = now;
                         }
                     }
 

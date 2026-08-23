@@ -24,9 +24,5 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
-      # Not -D warnings yet: this tree carries pre-existing warnings, and
-      # failing every build from the first commit would just get CI ignored.
-      # The count stays visible in the log; the flag goes on once it reaches
-      # zero.
       - name: Clippy
-        run: cargo clippy --all-targets
+        run: cargo clippy --all-targets -- -D warnings
