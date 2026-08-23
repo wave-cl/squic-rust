@@ -1,0 +1,22 @@
+[toolchain]
+# Pin stable to a specific minor version so new clippy lints don't surprise
+# CI between commits. CI (dtolnay/rust-toolchain@stable) honors this file,
+# so local and CI run the same clippy.
+#
+# This was not hypothetical: sqssh was clean under 1.95 locally and then
+# failed CI twice on lints that only exist in 1.98 (question_mark,
+# manual_c_str_literals, for_kv_map).
+#
+# Bump procedure: update the channel, run `cargo clippy --all-targets --
+# -D warnings` locally to pick up any new lints, fix them in the same commit
+# as the bump. Deliberate, not automatic.
+channel = "1.98.0"
+components = ["clippy", "rustfmt"]
+# Targets whose std-lib must be pre-installed for the pinned channel.
+# Adding a target via `rustup target add` outside this file attaches it to
+# whatever channel was last defaulted — NOT the pinned channel — so cargo
+# inside the workspace won't see it.
+#
+#   x86_64-unknown-linux-gnu — cross-building the sqperf example for the
+#                              ns server (via cargo-zigbuild).
+targets = ["x86_64-unknown-linux-gnu"]
