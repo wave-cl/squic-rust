@@ -307,3 +307,78 @@ async fn test_ipv6_connection() {
 
     server_task.await.unwrap();
 }
+
+/// A UDP relay that drops the first `drop_first` datagrams travelling
+/// client -> server, then forwards everything in both directions.
+/// Returns the address the client should dial.
+async fn lossy_relay(server: SocketAddr, drop_first: usize) -> SocketAddr {
+    let front = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let back = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let front_addr = front.local_addr().unwrap();
+    back.connect(server).await.unwrap();
+
+    tokio::spawn(async move {
+        let mut up = vec![0u8; 65536];
+        let mut down = vec![0u8; 65536];
+        let mut client: Option<SocketAddr> = None;
+        let mut dropped = 0usize;
+        loop {
+            tokio::select! {
+                Ok((n, from)) = front.recv_from(&mut up) => {
+                    client = Some(from);
+                    if dropped < drop_first {
+                        dropped += 1;
+                        continue; // blackhole it
+                    }
+                    let _ = back.send(&up[..n]).await;
+                }
+                Ok(n) = back.recv(&mut down) => {
+                    if let Some(c) = client {
+                        let _ = front.send_to(&down[..n], c).await;
+                    }
+                }
+            }
+        }
+    });
+
+    front_addr
+}
+
+#[tokio::test]
+async fn test_handshake_survives_initial_packet_loss() {
+    assert_handshake_survives_losing(1).await;
+}
+
+/// Several PTOs deep, the envelope must still be there.
+#[tokio::test]
+async fn test_handshake_survives_repeated_initial_loss() {
+    assert_handshake_survives_losing(3).await;
+}
+
+async fn assert_handshake_survives_losing(lost: usize) {
+    let (listener, _key, pub_key) = start_server(Config::default()).await;
+    let server_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Some(incoming) = listener.accept().await {
+            tokio::spawn(async move { let _ = incoming.await; });
+        }
+    });
+
+    // Blackhole the client's first datagrams. QUIC must retransmit the
+    // Initial, and every retransmission has to carry a valid MAC or the
+    // silent server drops it too.
+    let relay = lossy_relay(server_addr, lost).await;
+
+    let config = Config {
+        handshake_timeout: Some(Duration::from_secs(8)),
+        ..Config::default()
+    };
+    let started = std::time::Instant::now();
+    let conn = squic::dial(relay, &pub_key, config).await;
+    assert!(
+        conn.is_ok(),
+        "handshake failed after losing {lost} Initial(s) in {:?}: {:?}",
+        started.elapsed(),
+        conn.err()
+    );
+}

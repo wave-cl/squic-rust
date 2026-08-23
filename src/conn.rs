@@ -244,8 +244,7 @@ pub struct ClientSocket {
     inner: UdpSocketState,
     shared_secret: [u8; 32],
     client_pub_key: [u8; 32],
-    initial_sent: AtomicBool,
-    handshake_done: AtomicBool, // true after first non-cookie packet received; skips all checks
+    handshake_done: AtomicBool, // true after first non-cookie packet received; skips the cookie scan
     cookie: RwLock<Option<Vec<u8>>>, // stored cookie from server for MAC2
 }
 
@@ -261,7 +260,6 @@ impl ClientSocket {
             inner,
             shared_secret,
             client_pub_key,
-            initial_sent: AtomicBool::new(false),
             handshake_done: AtomicBool::new(false),
             cookie: RwLock::new(None),
         }
@@ -274,6 +272,60 @@ impl std::fmt::Debug for ClientSocket {
     }
 }
 
+impl ClientSocket {
+    /// Append the MAC1 envelope to one Initial datagram and send it raw.
+    ///
+    /// Every Initial must carry this envelope, not just the first: the server
+    /// silently drops any Initial that fails MAC1, so an unauthenticated
+    /// retransmission is indistinguishable from an attack and gets dropped.
+    /// A client that stopped stamping after the first packet could never
+    /// recover from losing it — the handshake would stall until it timed out.
+    fn send_initial(&self, datagram: &[u8], destination: SocketAddr) -> io::Result<()> {
+        let ts = now_timestamp();
+        let nonce = generate_nonce();
+        let mac1 = compute_mac1(&self.shared_secret, datagram, ts, &nonce);
+        let mut buf = Vec::with_capacity(datagram.len() + MAC_OVERHEAD);
+        buf.extend_from_slice(datagram);
+        buf.extend_from_slice(&self.client_pub_key);
+        buf.extend_from_slice(&ts.to_be_bytes());
+        buf.extend_from_slice(&nonce);
+        buf.extend_from_slice(&mac1);
+
+        // MAC2: zeros if no cookie, computed if the server has sent us one.
+        let cookie = self.cookie.read().unwrap();
+        if let Some(ref c) = *cookie {
+            let mac2 = compute_mac2(c, &buf, &mac1);
+            buf.extend_from_slice(&mac2);
+        } else {
+            buf.extend_from_slice(&[0u8; 16]); // MAC2 = zeros
+        }
+        drop(cookie);
+
+        // PERF NOTE: We bypass quinn-udp's UdpSocketState::send() here and
+        // send the Initial packet as a raw datagram via try_send_to().
+        //
+        // Why: The Initial packet is 1276 bytes (1200 QUIC + 76 MAC overhead),
+        // which exceeds Quinn's normal 1200-byte segment size. On Linux with
+        // GSO (Generic Segmentation Offload) enabled, quinn-udp's send() with
+        // segment_size: None is ambiguous — it may attempt to segment the packet
+        // at 1200 bytes, silently dropping it. This caused the Rust client to
+        // hang indefinitely during handshake on Linux VPS.
+        //
+        // Trade-off: Initial packets miss GSO, ECN marking, and sendmmsg
+        // batching from quinn-udp. This is acceptable because:
+        // 1. Initial packets are only sent while the handshake is in flight
+        // 2. All subsequent 1-RTT data packets go through quinn-udp normally
+        // 3. The Go client uses the same raw-send approach (WriteMsgUDP)
+        //
+        // If MAC_OVERHEAD changes, the static assertion in mac.rs will fail at
+        // compile time. If the overhead is ever reduced to fit within 1200 bytes,
+        // this bypass can be removed and the packet sent through quinn-udp.
+        self.io.try_io(Interest::WRITABLE, || {
+            (&*self.io).try_send_to(&buf, destination).map(|_| ())
+        })
+    }
+}
+
 impl AsyncUdpSocket for ClientSocket {
     fn create_io_poller(self: Arc<Self>) -> std::pin::Pin<Box<dyn quinn::UdpPoller>> {
         let io = self.io.clone();
@@ -281,61 +333,24 @@ impl AsyncUdpSocket for ClientSocket {
     }
 
     fn try_send(&self, transmit: &Transmit) -> io::Result<()> {
-        // Fast path: after handshake, all packets go directly to quinn-udp
-        if self.handshake_done.load(Ordering::Relaxed) {
+        // Hot path: short-header packets, which is everything after the
+        // handshake. One byte test, no atomics.
+        if !is_quic_initial(transmit.contents) {
             return self.io.try_io(Interest::WRITABLE, || {
                 self.inner.send((&*self.io).into(), transmit)
             });
         }
 
-        if !self.initial_sent.load(Ordering::Relaxed) && is_quic_initial(transmit.contents) {
-            self.initial_sent.store(true, Ordering::Relaxed);
-            let ts = now_timestamp();
-            let nonce = generate_nonce();
-            let mac1 = compute_mac1(&self.shared_secret, transmit.contents, ts, &nonce);
-            let mut buf = Vec::with_capacity(transmit.contents.len() + MAC_OVERHEAD);
-            buf.extend_from_slice(transmit.contents);
-            buf.extend_from_slice(&self.client_pub_key);
-            buf.extend_from_slice(&ts.to_be_bytes());
-            buf.extend_from_slice(&nonce);
-            buf.extend_from_slice(&mac1);
-
-            // MAC2: zeros if no cookie, computed if cookie available
-            let cookie = self.cookie.read().unwrap();
-            if let Some(ref c) = *cookie {
-                let mac2 = compute_mac2(c, &buf[..buf.len()], &mac1);
-                buf.extend_from_slice(&mac2);
-            } else {
-                buf.extend_from_slice(&[0u8; 16]); // MAC2 = zeros
+        // A GSO batch is several datagrams in one buffer; each needs its own
+        // envelope, so send them individually.
+        match transmit.segment_size {
+            Some(seg) if seg < transmit.contents.len() => {
+                for datagram in transmit.contents.chunks(seg) {
+                    self.send_initial(datagram, transmit.destination)?;
+                }
+                Ok(())
             }
-
-            // PERF NOTE: We bypass quinn-udp's UdpSocketState::send() here and
-            // send the Initial packet as a raw datagram via try_send_to().
-            //
-            // Why: The Initial packet is 1276 bytes (1200 QUIC + 76 MAC overhead),
-            // which exceeds Quinn's normal 1200-byte segment size. On Linux with
-            // GSO (Generic Segmentation Offload) enabled, quinn-udp's send() with
-            // segment_size: None is ambiguous — it may attempt to segment the packet
-            // at 1200 bytes, silently dropping it. This caused the Rust client to
-            // hang indefinitely during handshake on Linux VPS.
-            //
-            // Trade-off: This single Initial packet misses GSO, ECN marking, and
-            // sendmmsg batching from quinn-udp. This is acceptable because:
-            // 1. Initial packets are sent once per connection (not on the hot path)
-            // 2. All subsequent 1-RTT data packets go through quinn-udp normally
-            // 3. The Go client uses the same raw-send approach (WriteMsgUDP)
-            //
-            // If MAC_OVERHEAD changes, the static assertion in mac.rs will fail at
-            // compile time. If the overhead is ever reduced to fit within 1200 bytes,
-            // this bypass can be removed and the packet sent through quinn-udp.
-            self.io.try_io(Interest::WRITABLE, || {
-                (&*self.io).try_send_to(&buf, transmit.destination)
-                    .map(|_| ())
-            })
-        } else {
-            self.io.try_io(Interest::WRITABLE, || {
-                self.inner.send((&*self.io).into(), transmit)
-            })
+            _ => self.send_initial(transmit.contents, transmit.destination),
         }
     }
 
