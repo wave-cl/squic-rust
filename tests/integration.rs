@@ -382,3 +382,133 @@ async fn assert_handshake_survives_losing(lost: usize) {
         conn.err()
     );
 }
+
+/// Poll until the server's under-load state reaches `want`, or give up.
+async fn wait_for_under_load(listener: &squic::ServerListener, want: bool) -> bool {
+    for _ in 0..80 {
+        if listener.load_stats().under_load == want {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    false
+}
+
+/// The cookie defence has to admit legitimate clients, not just reject
+/// attackers. This exercises the whole exchange over real sockets: challenge,
+/// decrypt, retransmit carrying MAC2, accept.
+#[tokio::test]
+async fn test_cookie_challenge_admits_a_legitimate_client() {
+    let (listener, _key, pub_key) = start_server(Config::default()).await;
+    let addr = listener.local_addr().unwrap();
+    let listener = std::sync::Arc::new(listener);
+
+    // Under load before the first packet arrives. The load monitor re-evaluates
+    // once a second, so the client's retransmission — the packet that actually
+    // carries MAC2 — has to get there inside that window. A short initial RTT
+    // pulls the PTO down to a few hundred milliseconds and makes this
+    // deterministic rather than a race against the monitor.
+    listener.set_under_load(true);
+
+    let accepting = listener.clone();
+    tokio::spawn(async move {
+        while let Some(incoming) = accepting.accept().await {
+            tokio::spawn(async move {
+                let _ = incoming.await;
+            });
+        }
+    });
+
+    let config = Config {
+        initial_rtt: Some(Duration::from_millis(50)),
+        handshake_timeout: Some(Duration::from_secs(10)),
+        ..Config::default()
+    };
+    let started = std::time::Instant::now();
+    let conn = squic::dial(addr, &pub_key, config).await;
+    let elapsed = started.elapsed();
+
+    assert!(
+        conn.is_ok(),
+        "cookie challenge locked out a legitimate client after {elapsed:?}: {:?}",
+        conn.err()
+    );
+    let stats = listener.load_stats();
+    assert!(stats.cookie_replies_sent >= 1, "server never issued a challenge");
+    assert!(
+        stats.mac2_verified >= 1,
+        "the client's MAC2 never verified — the exchange did not complete: {stats:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "cookie exchange took {elapsed:?}, longer than the monitor window it has to fit inside"
+    );
+}
+
+/// Without the load monitor running, `under_load` stays false forever and the
+/// whole cookie branch is unreachable — which is how it shipped.
+#[tokio::test]
+async fn test_load_monitor_raises_and_clears_under_load() {
+    let config = Config {
+        load_threshold: Some(1),
+        ..Config::default()
+    };
+    let (listener, _key, pub_key) = start_server(config).await;
+    let addr = listener.local_addr().unwrap();
+    let listener = std::sync::Arc::new(listener);
+
+    let accepting = listener.clone();
+    tokio::spawn(async move {
+        while let Some(incoming) = accepting.accept().await {
+            tokio::spawn(async move {
+                let _ = incoming.await;
+            });
+        }
+    });
+
+    // Four handshakes in well under a second, against a threshold of one DH
+    // per second.
+    for _ in 0..4 {
+        squic::dial(addr, &pub_key, Config::default()).await.unwrap();
+    }
+
+    assert!(
+        wait_for_under_load(&listener, true).await,
+        "load monitor never raised under_load"
+    );
+    assert!(
+        wait_for_under_load(&listener, false).await,
+        "under_load never cleared once the load stopped"
+    );
+}
+
+/// `Some(0)` means off, as documented — not "use the default", which is what
+/// it used to quietly become.
+#[tokio::test]
+async fn test_zero_load_threshold_disables_the_cookie_defence() {
+    let config = Config {
+        load_threshold: Some(0),
+        ..Config::default()
+    };
+    let (listener, _key, pub_key) = start_server(config).await;
+    let addr = listener.local_addr().unwrap();
+    let listener = std::sync::Arc::new(listener);
+
+    let accepting = listener.clone();
+    tokio::spawn(async move {
+        while let Some(incoming) = accepting.accept().await {
+            tokio::spawn(async move {
+                let _ = incoming.await;
+            });
+        }
+    });
+
+    for _ in 0..4 {
+        squic::dial(addr, &pub_key, Config::default()).await.unwrap();
+    }
+    assert!(
+        !wait_for_under_load(&listener, true).await,
+        "cookie defence engaged despite being disabled"
+    );
+    assert_eq!(listener.load_stats().cookie_replies_sent, 0);
+}

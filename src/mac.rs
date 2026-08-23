@@ -1,6 +1,6 @@
 use chacha20poly1305::{aead::Aead, aead::KeyInit as AeadKeyInit, XChaCha20Poly1305};
 use hmac::{Hmac, Mac};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use std::net::IpAddr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -36,6 +36,12 @@ pub const COOKIE_NONCE_SIZE: usize = 24;
 
 /// Maximum age/future of a timestamp before the server rejects it (seconds).
 pub const REPLAY_WINDOW: i64 = 120;
+
+/// Domain separator for the cookie-reply encryption key.
+const COOKIE_KEY_LABEL: &[u8] = b"squic-cookie-v1";
+
+/// How long a cookie secret stays current before rotating.
+pub const COOKIE_SECRET_LIFETIME_SECS: u64 = 120;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -127,6 +133,25 @@ pub fn cookie_value(secret: &[u8; 32], client_ip: IpAddr) -> [u8; 16] {
     let mut cookie = [0u8; 16];
     cookie.copy_from_slice(&result[..16]);
     cookie
+}
+
+/// Derive the key that encrypts cookie replies, from the server's X25519
+/// public key.
+///
+/// Both ends can compute this without a Diffie-Hellman: the server holds the
+/// matching private key, and any legitimate client already knows the server's
+/// public key — that is the premise of a silent server. Keying it off the DH
+/// shared secret instead would defeat the purpose, since the cookie exists
+/// precisely so the server does not have to do a DH for an unverified caller.
+///
+/// An attacker who does not hold the server's public key cannot read the
+/// cookie, and one who does could already make the server do DH work, so
+/// nothing is given away.
+pub fn cookie_key(server_x25519_pub: &[u8; 32]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(COOKIE_KEY_LABEL);
+    hasher.update(server_x25519_pub);
+    hasher.finalize().into()
 }
 
 /// Encrypt a cookie for sending to the client.

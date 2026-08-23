@@ -1,7 +1,8 @@
 use crate::mac::{
-    compute_mac1, compute_mac2, cookie_value, encrypt_cookie, generate_nonce, is_quic_initial,
-    now_timestamp, timestamp_in_window, verify_mac1, verify_mac2, CLIENT_KEY_SIZE,
-    COOKIE_REPLY_TYPE, MAC_OVERHEAD, MAC_SIZE, NONCE_SIZE, TIMESTAMP_SIZE,
+    compute_mac1, compute_mac2, cookie_value, decrypt_cookie, encrypt_cookie, generate_nonce,
+    is_quic_initial, now_timestamp, timestamp_in_window, verify_mac1, verify_mac2,
+    CLIENT_KEY_SIZE, COOKIE_REPLY_TYPE, COOKIE_SECRET_LIFETIME_SECS, MAC2_SIZE, MAC_OVERHEAD, MAC_SIZE,
+    NONCE_SIZE, TIMESTAMP_SIZE,
 };
 use crate::whitelist::Whitelist;
 use quinn::udp::{RecvMeta, Transmit, UdpSocketState};
@@ -9,8 +10,9 @@ use quinn::AsyncUdpSocket;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, Weak};
 use std::task::{Context, Poll};
+use std::time::Duration;
 use tokio::io::Interest;
 use x25519_dalek::{PublicKey as X25519Public, StaticSecret as X25519Secret};
 
@@ -22,10 +24,13 @@ pub struct ServerSocket {
     server_x25519_priv: X25519Secret,
     whitelist: Arc<Whitelist>,
     // MAC2 + cookie DDoS protection
+    cookie_key: [u8; 32],
     cookie_secret: RwLock<[u8; 32]>,
     prev_cookie_secret: RwLock<[u8; 32]>,
     under_load: AtomicBool,
     dh_count: AtomicU64,
+    cookie_replies: AtomicU64,
+    mac2_verified: AtomicU64,
     load_threshold: u64,
 }
 
@@ -37,20 +42,30 @@ impl ServerSocket {
         load_threshold: u64,
     ) -> Self {
         let inner = UdpSocketState::new((&*socket).into()).expect("UdpSocketState::new");
-        let mut secret1 = [0u8; 32];
-        let mut secret2 = [0u8; 32];
-        getrandom::fill(&mut secret1).expect("getrandom failed");
-        getrandom::fill(&mut secret2).expect("getrandom failed");
+        let cookie_key = crate::mac::cookie_key(
+            X25519Public::from(&server_x25519_priv).as_bytes(),
+        );
+        let mut secret = [0u8; 32];
+        getrandom::fill(&mut secret).expect("getrandom failed");
         Self {
             io: socket,
             inner,
             server_x25519_priv,
             whitelist,
-            cookie_secret: RwLock::new(secret1),
-            prev_cookie_secret: RwLock::new(secret2),
+            cookie_key,
+            // The previous secret starts out equal to the current one rather
+            // than random: until the first rotation there is no earlier secret,
+            // and seeding it randomly would make the grace branch check a
+            // secret that was never in use.
+            cookie_secret: RwLock::new(secret),
+            prev_cookie_secret: RwLock::new(secret),
             under_load: AtomicBool::new(false),
             dh_count: AtomicU64::new(0),
-            load_threshold: if load_threshold == 0 { 1000 } else { load_threshold },
+            cookie_replies: AtomicU64::new(0),
+            mac2_verified: AtomicU64::new(0),
+            // Zero means the caller turned the cookie defence off; it is not a
+            // stand-in for the default, which lib.rs has already applied.
+            load_threshold,
         }
     }
 
@@ -106,7 +121,9 @@ impl ServerSocket {
                 }
             }
 
-            if !mac2_valid {
+            if mac2_valid {
+                self.mac2_verified.fetch_add(1, Ordering::Relaxed);
+            } else {
                 // Send cookie reply and drop
                 if let Some(a) = addr {
                     self.send_cookie_reply(a);
@@ -137,12 +154,78 @@ impl ServerSocket {
     fn send_cookie_reply(&self, addr: SocketAddr) {
         let secret = *self.cookie_secret.read().unwrap();
         let cookie = cookie_value(&secret, addr.ip());
-        if let Some(encrypted) = encrypt_cookie(&secret, &cookie) {
+        // Encrypted under the key derived from our public key, which the
+        // client can also derive — not under `secret`, which is ours alone and
+        // which the client could never decrypt with.
+        if let Some(encrypted) = encrypt_cookie(&self.cookie_key, &cookie) {
             let mut reply = Vec::with_capacity(1 + encrypted.len());
             reply.push(COOKIE_REPLY_TYPE);
             reply.extend_from_slice(&encrypted);
+            self.cookie_replies.fetch_add(1, Ordering::Relaxed);
             let _ = self.io.try_send_to(&reply, addr);
         }
+    }
+
+    /// Start the background work the cookie defence depends on: one task
+    /// tracking DH load, one rotating the cookie secret.
+    ///
+    /// Without these `under_load` never becomes true and the whole MAC2 branch
+    /// is unreachable, and `prev_cookie_secret` never holds a secret that was
+    /// actually in use. Both hold a `Weak` reference and stop as soon as the
+    /// endpoint is dropped, so a short-lived server does not leak a pair of
+    /// tasks that keep its socket alive.
+    pub fn spawn_maintenance(socket: &Arc<Self>) {
+        if socket.load_threshold == 0 {
+            // Cookie defence disabled: no load to track, and no cookies to
+            // rotate secrets for.
+            return;
+        }
+
+        let weak: Weak<Self> = Arc::downgrade(socket);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(1));
+            // The first tick completes immediately, over a window that has not
+            // elapsed yet. Discard it rather than judging load on no data.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                let Some(s) = weak.upgrade() else { return };
+                let count = s.dh_count.swap(0, Ordering::Relaxed);
+                s.under_load.store(count > s.load_threshold, Ordering::Relaxed);
+            }
+        });
+
+        let weak: Weak<Self> = Arc::downgrade(socket);
+        tokio::spawn(async move {
+            let mut ticker =
+                tokio::time::interval(Duration::from_secs(COOKIE_SECRET_LIFETIME_SECS));
+            ticker.tick().await; // the first tick completes immediately
+            loop {
+                ticker.tick().await;
+                let Some(s) = weak.upgrade() else { return };
+                let mut fresh = [0u8; 32];
+                getrandom::fill(&mut fresh).expect("getrandom failed");
+                let current = *s.cookie_secret.read().unwrap();
+                *s.prev_cookie_secret.write().unwrap() = current;
+                *s.cookie_secret.write().unwrap() = fresh;
+            }
+        });
+    }
+
+    /// A snapshot of the cookie defence's state.
+    pub fn load_stats(&self) -> crate::LoadStats {
+        crate::LoadStats {
+            under_load: self.under_load.load(Ordering::Relaxed),
+            cookie_replies_sent: self.cookie_replies.load(Ordering::Relaxed),
+            mac2_verified: self.mac2_verified.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Force the under-load state, so a test does not have to win a race with
+    /// the one-second load monitor to exercise the cookie path.
+    #[doc(hidden)]
+    pub fn set_under_load(&self, value: bool) {
+        self.under_load.store(value, Ordering::Relaxed);
     }
 }
 
@@ -244,8 +327,9 @@ pub struct ClientSocket {
     inner: UdpSocketState,
     shared_secret: [u8; 32],
     client_pub_key: [u8; 32],
+    cookie_key: [u8; 32], // decrypts cookie replies; derived from the server's public key
     handshake_done: AtomicBool, // true after first non-cookie packet received; skips the cookie scan
-    cookie: RwLock<Option<Vec<u8>>>, // stored cookie from server for MAC2
+    cookie: RwLock<Option<[u8; 16]>>, // decrypted cookie from the server, keys MAC2
 }
 
 impl ClientSocket {
@@ -253,6 +337,7 @@ impl ClientSocket {
         socket: Arc<tokio::net::UdpSocket>,
         shared_secret: [u8; 32],
         client_pub_key: [u8; 32],
+        cookie_key: [u8; 32],
     ) -> Self {
         let inner = UdpSocketState::new((&*socket).into()).expect("UdpSocketState::new");
         Self {
@@ -260,6 +345,7 @@ impl ClientSocket {
             inner,
             shared_secret,
             client_pub_key,
+            cookie_key,
             handshake_done: AtomicBool::new(false),
             cookie: RwLock::new(None),
         }
@@ -281,25 +367,8 @@ impl ClientSocket {
     /// A client that stopped stamping after the first packet could never
     /// recover from losing it — the handshake would stall until it timed out.
     fn send_initial(&self, datagram: &[u8], destination: SocketAddr) -> io::Result<()> {
-        let ts = now_timestamp();
-        let nonce = generate_nonce();
-        let mac1 = compute_mac1(&self.shared_secret, datagram, ts, &nonce);
-        let mut buf = Vec::with_capacity(datagram.len() + MAC_OVERHEAD);
-        buf.extend_from_slice(datagram);
-        buf.extend_from_slice(&self.client_pub_key);
-        buf.extend_from_slice(&ts.to_be_bytes());
-        buf.extend_from_slice(&nonce);
-        buf.extend_from_slice(&mac1);
-
-        // MAC2: zeros if no cookie, computed if the server has sent us one.
-        let cookie = self.cookie.read().unwrap();
-        if let Some(ref c) = *cookie {
-            let mac2 = compute_mac2(c, &buf, &mac1);
-            buf.extend_from_slice(&mac2);
-        } else {
-            buf.extend_from_slice(&[0u8; 16]); // MAC2 = zeros
-        }
-        drop(cookie);
+        let cookie = *self.cookie.read().unwrap();
+        let buf = self.build_initial(datagram, cookie.as_ref());
 
         // PERF NOTE: We bypass quinn-udp's UdpSocketState::send() here and
         // send the Initial packet as a raw datagram via try_send_to().
@@ -323,6 +392,57 @@ impl ClientSocket {
         self.io.try_io(Interest::WRITABLE, || {
             (&*self.io).try_send_to(&buf, destination).map(|_| ())
         })
+    }
+
+    /// Open a cookie reply and keep the cookie for the next Initial.
+    ///
+    /// The reply arrives encrypted; MAC2 is keyed on the plaintext, so it has
+    /// to be opened here. A reply we cannot open did not come from a server
+    /// holding the key we expect, so it is dropped and any cookie we already
+    /// had is kept. Returns whether a cookie was stored.
+    fn store_cookie(&self, payload: &[u8]) -> bool {
+        let Some(plain) = decrypt_cookie(&self.cookie_key, payload) else {
+            return false;
+        };
+        match <[u8; 16]>::try_from(plain.as_slice()) {
+            Ok(c) => {
+                *self.cookie.write().unwrap() = Some(c);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Build one Initial datagram plus its MAC envelope.
+    ///
+    /// Kept separate from the send so a test can check the bytes against what
+    /// `ServerSocket::validate_and_strip` expects — the two sides disagreeing
+    /// about what MAC2 covers is exactly the defect this guards.
+    fn build_initial(&self, datagram: &[u8], cookie: Option<&[u8; 16]>) -> Vec<u8> {
+        let ts = now_timestamp();
+        let nonce = generate_nonce();
+        let mac1 = compute_mac1(&self.shared_secret, datagram, ts, &nonce);
+        let mut buf = Vec::with_capacity(datagram.len() + MAC_OVERHEAD);
+        buf.extend_from_slice(datagram);
+        buf.extend_from_slice(&self.client_pub_key);
+        buf.extend_from_slice(&ts.to_be_bytes());
+        buf.extend_from_slice(&nonce);
+        buf.extend_from_slice(&mac1);
+
+        // MAC2: zeros if no cookie, computed if the server has sent us one.
+        //
+        // The server verifies over everything up to but NOT including mac1,
+        // passing mac1 separately, so the slice here has to stop short of the
+        // mac1 we just appended. Hashing buf whole folds mac1 in twice and
+        // never verifies.
+        match cookie {
+            Some(c) => {
+                let mac2 = compute_mac2(c, &buf[..buf.len() - MAC_SIZE], &mac1);
+                buf.extend_from_slice(&mac2);
+            }
+            None => buf.extend_from_slice(&[0u8; MAC2_SIZE]),
+        }
+        buf
     }
 }
 
@@ -376,8 +496,7 @@ impl AsyncUdpSocket for ClientSocket {
                 for i in 0..count {
                     let len = metas[i].len;
                     if len > 0 && bufs[i][0] == COOKIE_REPLY_TYPE {
-                        let cookie_data = bufs[i][1..len].to_vec();
-                        *self.cookie.write().unwrap() = Some(cookie_data);
+                        self.store_cookie(&bufs[i][1..len]);
                         is_cookie[i] = true;
                         any_cookie = true;
                     }
@@ -452,3 +571,141 @@ impl quinn::UdpPoller for UdpPollWritable {
 }
 
 use std::task::ready;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::{ed25519_private_to_x25519, x25519};
+    use crate::mac::cookie_key;
+
+    async fn socket() -> Arc<tokio::net::UdpSocket> {
+        Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap())
+    }
+
+    /// Build a matched client and server over loopback sockets.
+    async fn pair() -> (ServerSocket, ClientSocket) {
+        let (signing_key, _) = crate::crypto::generate_keypair();
+        let server_priv = ed25519_private_to_x25519(&signing_key);
+        let server_pub = X25519Public::from(&server_priv);
+
+        let client_priv = x25519_dalek::StaticSecret::random_from_rng(rand_core::OsRng);
+        let client_pub = X25519Public::from(&client_priv);
+        let shared = x25519(&client_priv, &server_pub);
+
+        let server = ServerSocket::new(
+            socket().await,
+            server_priv,
+            Arc::new(Whitelist::new(None)),
+            1000,
+        );
+        let client = ClientSocket::new(
+            socket().await,
+            shared,
+            client_pub.to_bytes(),
+            cookie_key(server_pub.as_bytes()),
+        );
+        (server, client)
+    }
+
+    /// The four-way defect this pins down: the client has to be able to open
+    /// the cookie at all, and then MAC2 has to cover exactly the bytes the
+    /// server checks. Any of those disagreeing and the cookie defence rejects
+    /// every legitimate client instead of only attackers.
+    #[tokio::test]
+    async fn client_mac2_is_what_the_server_verifies() {
+        let (server, client) = pair().await;
+        let peer = client.io.local_addr().unwrap();
+
+        // Let the server issue a real challenge over a real socket, and let
+        // the client open it with the code path poll_recv uses. Anything
+        // reimplemented here would test the reimplementation instead.
+        // send_cookie_reply is deliberately best-effort — it uses try_send_to
+        // and drops the reply rather than blocking the recv path, so retry
+        // until one lands.
+        let mut reply = [0u8; 256];
+        let n = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                server.send_cookie_reply(peer);
+                if let Ok(Ok((n, _))) = tokio::time::timeout(
+                    Duration::from_millis(50),
+                    client.io.recv_from(&mut reply),
+                )
+                .await
+                {
+                    return n;
+                }
+            }
+        })
+        .await
+        .expect("no cookie reply arrived");
+        assert_eq!(reply[0], COOKIE_REPLY_TYPE);
+        assert!(
+            client.store_cookie(&reply[1..n]),
+            "client cannot open the cookie the server sent"
+        );
+        let cookie = client.cookie.read().unwrap().expect("cookie stored");
+
+        // An Initial carrying that cookie must satisfy a server demanding one.
+        server.set_under_load(true);
+        let datagram = vec![0xC0u8; 1200];
+        let mut envelope = client.build_initial(&datagram, Some(&cookie));
+        let len = envelope.len();
+
+        assert_eq!(
+            server.validate_and_strip(&mut envelope, len, Some(peer)),
+            Some(1200),
+            "server rejected an Initial carrying a cookie it issued itself"
+        );
+        assert_eq!(server.load_stats().mac2_verified, 1);
+    }
+
+    /// The other half: no cookie means challenged, not admitted.
+    #[tokio::test]
+    async fn under_load_an_initial_without_a_cookie_is_challenged() {
+        let (server, client) = pair().await;
+        let peer: SocketAddr = "127.0.0.1:40001".parse().unwrap();
+        server.set_under_load(true);
+
+        let datagram = vec![0xC0u8; 1200];
+        let mut envelope = client.build_initial(&datagram, None);
+        let len = envelope.len();
+
+        assert_eq!(server.validate_and_strip(&mut envelope, len, Some(peer)), None);
+        let stats = server.load_stats();
+        assert_eq!(stats.mac2_verified, 0);
+        assert_eq!(stats.cookie_replies_sent, 1);
+    }
+
+    /// A cookie minted for one address must not travel to another.
+    #[tokio::test]
+    async fn a_cookie_is_bound_to_the_address_it_was_issued_for() {
+        let (server, client) = pair().await;
+        let issued_to: SocketAddr = "127.0.0.1:40002".parse().unwrap();
+        let used_by: SocketAddr = "127.0.0.2:40002".parse().unwrap();
+        server.set_under_load(true);
+
+        let secret = *server.cookie_secret.read().unwrap();
+        let cookie = cookie_value(&secret, issued_to.ip());
+
+        let datagram = vec![0xC0u8; 1200];
+        let mut envelope = client.build_initial(&datagram, Some(&cookie));
+        let len = envelope.len();
+
+        assert_eq!(server.validate_and_strip(&mut envelope, len, Some(used_by)), None);
+        assert_eq!(server.load_stats().mac2_verified, 0);
+    }
+
+    /// Not under load, MAC2 is not consulted, so the zeros a fresh client sends
+    /// are fine. This is the path every normal connection takes.
+    #[tokio::test]
+    async fn without_load_no_cookie_is_required() {
+        let (server, client) = pair().await;
+        let peer: SocketAddr = "127.0.0.1:40003".parse().unwrap();
+
+        let datagram = vec![0xC0u8; 1200];
+        let mut envelope = client.build_initial(&datagram, None);
+        let len = envelope.len();
+
+        assert_eq!(server.validate_and_strip(&mut envelope, len, Some(peer)), Some(1200));
+    }
+}

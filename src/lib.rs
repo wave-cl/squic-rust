@@ -93,8 +93,9 @@ pub struct Config {
     /// When set, dial() uses this persistent identity instead of generating an ephemeral one.
     /// The client's X25519 public key is derived from this for MAC1 and whitelist matching.
     pub client_key: Option<String>,
-    /// DH operations per second before entering under-load mode (MAC2 required).
-    /// Default: 1000. Set to 0 to disable MAC2 protection.
+    /// DH operations per second before the server enters under-load mode and
+    /// starts requiring a cookie (MAC2) from callers it has not challenged yet.
+    /// Default: 1000. `Some(0)` disables the cookie defence entirely.
     pub load_threshold: Option<u64>,
 }
 
@@ -122,10 +123,26 @@ impl Default for Config {
     }
 }
 
+/// A snapshot of the server's cookie-based DDoS defence.
+///
+/// Worth watching: `under_load` means the server has stopped doing
+/// Diffie-Hellman for callers that have not echoed back a cookie, which costs
+/// every new client an extra round trip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoadStats {
+    /// Whether the server is currently demanding a valid MAC2.
+    pub under_load: bool,
+    /// Cookie challenges issued since start.
+    pub cookie_replies_sent: u64,
+    /// Initial packets accepted on a valid MAC2 since start.
+    pub mac2_verified: u64,
+}
+
 /// Server listener with silent-server support.
 pub struct ServerListener {
     endpoint: quinn::Endpoint,
     whitelist: Arc<Whitelist>,
+    socket: Arc<ServerSocket>,
 }
 
 impl ServerListener {
@@ -167,6 +184,18 @@ impl ServerListener {
     /// Get the local address.
     pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
         self.endpoint.local_addr()
+    }
+
+    /// A snapshot of the cookie defence's state.
+    pub fn load_stats(&self) -> LoadStats {
+        self.socket.load_stats()
+    }
+
+    /// Force the under-load state. Exposed for tests, which would otherwise
+    /// have to win a race with the one-second load monitor.
+    #[doc(hidden)]
+    pub fn set_under_load(&self, value: bool) {
+        self.socket.set_under_load(value);
     }
 
     /// Close the listener.
@@ -225,7 +254,13 @@ pub async fn listen(
     let socket = Arc::new(tokio::net::UdpSocket::from_std(std_socket).map_err(Error::Io)?);
 
     let load_threshold = config.load_threshold.unwrap_or(1000);
-    let server_socket = ServerSocket::new(socket, server_x25519_priv, whitelist.clone(), load_threshold);
+    let server_socket = Arc::new(ServerSocket::new(
+        socket,
+        server_x25519_priv,
+        whitelist.clone(),
+        load_threshold,
+    ));
+    ServerSocket::spawn_maintenance(&server_socket);
 
     let tls_config = tls::server_tls_config(signing_key, &config.alpn_protocols)?;
     let quic_server_config: quinn_proto::crypto::rustls::QuicServerConfig = tls_config
@@ -249,13 +284,14 @@ pub async fn listen(
     let endpoint = quinn::Endpoint::new_with_abstract_socket(
         quinn::EndpointConfig::default(),
         Some(server_config),
-        Arc::new(server_socket),
+        server_socket.clone(),
         runtime,
     )?;
 
     Ok(ServerListener {
         endpoint,
         whitelist,
+        socket: server_socket,
     })
 }
 
@@ -299,7 +335,9 @@ pub async fn dial(
     let std_socket = create_udp_socket(bind_addr)?;
     let socket = Arc::new(tokio::net::UdpSocket::from_std(std_socket).map_err(Error::Io)?);
 
-    let client_socket = ClientSocket::new(socket, shared, client_x25519_pub.to_bytes());
+    let cookie_key = crate::mac::cookie_key(server_x25519_pub.as_bytes());
+    let client_socket =
+        ClientSocket::new(socket, shared, client_x25519_pub.to_bytes(), cookie_key);
 
     let tls_config = tls::client_tls_config(server_pub_key, &config.alpn_protocols)?;
     let quic_client_config: quinn_proto::crypto::rustls::QuicClientConfig = tls_config
