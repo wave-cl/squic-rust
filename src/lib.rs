@@ -143,12 +143,28 @@ pub struct ServerListener {
     endpoint: quinn::Endpoint,
     whitelist: Arc<Whitelist>,
     socket: Arc<ServerSocket>,
+    public_key: [u8; 32],
 }
 
 impl ServerListener {
     /// Accept the next incoming connection.
     pub async fn accept(&self) -> Option<quinn::Incoming> {
         self.endpoint.accept().await
+    }
+
+    /// This server's Ed25519 public key — the one clients pin when they dial.
+    ///
+    /// This is the identity half of the signing key passed to [`listen`], and
+    /// it is what a client supplies as `server_pub_key` to [`dial`]. Callers
+    /// otherwise have to keep a copy of it alongside the listener, which is
+    /// how it has been done so far.
+    ///
+    /// Note this is the *server's own* key, not the caller's: sQUIC verifies
+    /// the peer's X25519 key while validating the Initial packet, but does not
+    /// currently surface it, and it could not be reported as Ed25519 in any
+    /// case — the map from Ed25519 to X25519 does not run backwards.
+    pub fn public_key(&self) -> [u8; 32] {
+        self.public_key
     }
 
     /// Add a client key to the whitelist.
@@ -292,6 +308,7 @@ pub async fn listen(
         endpoint,
         whitelist,
         socket: server_socket,
+        public_key: signing_key.verifying_key().to_bytes(),
     })
 }
 

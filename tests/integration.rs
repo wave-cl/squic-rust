@@ -513,3 +513,41 @@ async fn test_zero_load_threshold_disables_the_cookie_defence() {
     );
     assert_eq!(listener.load_stats().cookie_replies_sent, 0);
 }
+
+#[tokio::test]
+async fn test_server_public_key_is_dialable() {
+    let (listener, signing_key, pub_key) = start_server(Config::default()).await;
+    let addr = listener.local_addr().unwrap();
+
+    // The accessor agrees with both the keypair it was built from and the
+    // signing key's own verifying half.
+    assert_eq!(listener.public_key(), pub_key);
+    assert_eq!(listener.public_key(), signing_key.verifying_key().to_bytes());
+
+    // The point of the accessor is that a caller need not have kept a copy, so
+    // dial with the key the listener reports rather than the one we generated.
+    // A wrong key here fails the handshake outright: the client pins it, and
+    // MAC1 is computed against it.
+    let reported = listener.public_key();
+
+    let server_task = tokio::spawn(async move {
+        let incoming = listener.accept().await.unwrap();
+        let conn = incoming.await.unwrap();
+        let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+        let mut buf = vec![0u8; 64];
+        let n = recv.read(&mut buf).await.unwrap().unwrap();
+        send.write_all(&buf[..n]).await.unwrap();
+        send.finish().unwrap();
+        let _ = send.stopped().await;
+    });
+
+    let conn = squic::dial(addr, &reported, Config::default()).await.unwrap();
+    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    send.write_all(b"ping").await.unwrap();
+    send.finish().unwrap();
+    let mut buf = vec![0u8; 64];
+    let n = recv.read(&mut buf).await.unwrap().unwrap();
+    assert_eq!(&buf[..n], b"ping");
+
+    server_task.await.unwrap();
+}
