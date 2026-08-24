@@ -50,8 +50,22 @@ pub fn ed25519_public_to_x25519(ed_pub: &[u8; 32]) -> Result<X25519Public, crate
 }
 
 /// Perform X25519 Diffie-Hellman.
-pub fn x25519(secret: &X25519Secret, public: &X25519Public) -> [u8; 32] {
-    secret.diffie_hellman(public).to_bytes()
+/// Diffie-Hellman, refusing a non-contributory exchange.
+///
+/// A small-order peer key yields an all-zero shared secret regardless of our
+/// own key, which anyone can predict without knowing either party's public
+/// key. Returning it would let a MAC computed by a stranger verify.
+pub fn x25519(
+    secret: &X25519Secret,
+    public: &X25519Public,
+) -> Result<[u8; 32], crate::Error> {
+    let shared = secret.diffie_hellman(public);
+    if !shared.was_contributory() {
+        return Err(crate::Error::InvalidKey(
+            "peer key is of small order; the exchange carries no secret",
+        ));
+    }
+    Ok(shared.to_bytes())
 }
 
 /// Convert an Ed25519 VerifyingKey to X25519 public key bytes.
@@ -97,8 +111,8 @@ mod tests {
         let server_x25519_pub = ed25519_public_to_x25519(&server_pub).unwrap();
         let client_x25519_pub = x25519_dalek::PublicKey::from(&client_x25519_priv);
 
-        let shared_client = x25519(&client_x25519_priv, &server_x25519_pub);
-        let shared_server = x25519(&server_x25519_priv, &client_x25519_pub);
+        let shared_client = x25519(&client_x25519_priv, &server_x25519_pub).unwrap();
+        let shared_server = x25519(&server_x25519_priv, &client_x25519_pub).unwrap();
         assert_eq!(shared_client, shared_server);
     }
 }

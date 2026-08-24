@@ -321,7 +321,7 @@ pub async fn dial(
 
     // DH shared secret
     let server_x25519_pub = ed25519_public_to_x25519(server_pub_key)?;
-    let shared = x25519(&client_x25519_priv, &server_x25519_pub);
+    let shared = x25519(&client_x25519_priv, &server_x25519_pub)?;
 
     // Bind in the same family as the peer. Quinn refuses a remote whose
     // address family does not match its endpoint, so a socket bound to

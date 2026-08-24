@@ -144,6 +144,16 @@ impl ServerSocket {
         let client_x25519 = X25519Public::from(key);
         let shared = self.server_x25519_priv.diffie_hellman(&client_x25519);
 
+        // A small-order client key makes the exchange non-contributory: the
+        // shared secret comes out all zeros whatever our private key is, so a
+        // caller who has never seen our public key can compute it in advance
+        // and forge a MAC1 that verifies. That defeats the silent server
+        // outright for any deployment without a whitelist, and it is the
+        // whitelist — not this check — that has been carrying us.
+        if !shared.was_contributory() {
+            return None;
+        }
+
         if !verify_mac1(shared.as_bytes(), &buf[..quic_len], timestamp, nonce, mac1) {
             return None;
         }
@@ -618,7 +628,7 @@ mod tests {
 
         let client_priv = x25519_dalek::StaticSecret::random_from_rng(rand_core::OsRng);
         let client_pub = X25519Public::from(&client_priv);
-        let shared = x25519(&client_priv, &server_pub);
+        let shared = x25519(&client_priv, &server_pub).unwrap();
 
         let server = ServerSocket::new(
             socket().await,
@@ -721,6 +731,54 @@ mod tests {
 
         assert_eq!(server.validate_and_strip(&mut envelope, len, Some(used_by)), None);
         assert_eq!(server.load_stats().mac2_verified, 0);
+    }
+
+    /// A caller who has never seen the server's public key must not be able to
+    /// pass MAC1. A small-order client key makes the exchange non-contributory
+    /// — the shared secret is all zeros whatever the server's key is, and the
+    /// attacker knows that in advance — so without the guard this succeeds and
+    /// the silent server answers a stranger.
+    #[tokio::test]
+    async fn a_small_order_client_key_is_refused() {
+        let (server, _client) = pair().await;
+        let peer: SocketAddr = "127.0.0.1:40404".parse().unwrap();
+
+        let datagram = vec![0xC0u8; 1200];
+        let zero_key = [0u8; 32];
+        // The attacker assumes the exchange yields zeros, and is right.
+        let assumed_shared = [0u8; 32];
+
+        let ts = now_timestamp();
+        let nonce = generate_nonce();
+        let mac1 = compute_mac1(&assumed_shared, &datagram, ts, &nonce);
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&datagram);
+        buf.extend_from_slice(&zero_key);
+        buf.extend_from_slice(&ts.to_be_bytes());
+        buf.extend_from_slice(&nonce);
+        buf.extend_from_slice(&mac1);
+        buf.extend_from_slice(&[0u8; MAC2_SIZE]);
+        let len = buf.len();
+
+        assert_eq!(
+            server.validate_and_strip(&mut buf, len, Some(peer)),
+            None,
+            "a stranger forged a valid MAC1 with a small-order key"
+        );
+    }
+
+    /// The same degenerate exchange reached from the other side: a client given
+    /// a server key of small order must refuse rather than proceed with a
+    /// secret anyone can predict.
+    #[tokio::test]
+    async fn a_small_order_server_key_is_refused() {
+        let priv_key = x25519_dalek::StaticSecret::random_from_rng(rand_core::OsRng);
+        let zero_pub = X25519Public::from([0u8; 32]);
+        assert!(
+            crate::crypto::x25519(&priv_key, &zero_pub).is_err(),
+            "client accepted a non-contributory exchange"
+        );
     }
 
     /// Not under load, MAC2 is not consulted, so the zeros a fresh client sends
