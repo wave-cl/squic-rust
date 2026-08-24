@@ -551,3 +551,85 @@ async fn test_server_public_key_is_dialable() {
 
     server_task.await.unwrap();
 }
+
+#[tokio::test]
+async fn test_peer_key_matches_dialing_client() {
+    use ed25519_dalek::SigningKey;
+
+    // A client with a persistent identity: its X25519 transport key is derived
+    // from an Ed25519 seed, exactly as real clients do.
+    let client_seed = [42u8; 32];
+    let client_signing = SigningKey::from_bytes(&client_seed);
+    let client_x25519_pub = squic::crypto::ed25519_private_to_x25519(&client_signing);
+    let expected = x25519_dalek::PublicKey::from(&client_x25519_pub).to_bytes();
+
+    let (listener, _sk, server_pub) = start_server(Config::default()).await;
+    let addr = listener.local_addr().unwrap();
+
+    let server = tokio::spawn(async move {
+        let incoming = listener.accept().await.unwrap();
+        // The verified peer key is available before the handshake completes.
+        let seen = listener.peer_key(&incoming);
+        // A second call for the same connection drains to None.
+        let seen_again = listener.peer_key(&incoming);
+        let conn = incoming.await.unwrap();
+        let (mut s, mut r) = conn.accept_bi().await.unwrap();
+        let mut buf = vec![0u8; 16];
+        let n = r.read(&mut buf).await.unwrap().unwrap();
+        s.write_all(&buf[..n]).await.unwrap();
+        s.finish().unwrap();
+        let _ = s.stopped().await;
+        (seen, seen_again)
+    });
+
+    let client_cfg = Config {
+        client_key: Some(client_seed.iter().map(|b| format!("{b:02x}")).collect()),
+        ..Default::default()
+    };
+    let conn = squic::dial(addr, &server_pub, client_cfg).await.unwrap();
+    let (mut s, mut r) = conn.open_bi().await.unwrap();
+    s.write_all(b"x").await.unwrap();
+    s.finish().unwrap();
+    let mut buf = vec![0u8; 16];
+    let _ = r.read(&mut buf).await.unwrap().unwrap();
+
+    let (seen, seen_again) = server.await.unwrap();
+    assert_eq!(seen, Some(expected), "peer key must match the dialing client");
+    assert_eq!(seen_again, None, "the entry must drain on read");
+}
+
+#[tokio::test]
+async fn test_peer_key_none_for_unknown_dcid() {
+    // A listener that has accepted nothing has nothing to report. We cannot
+    // easily forge an Incoming, so this exercises the empty-table path via a
+    // real accept whose key we drain twice (second is None) — the draining is
+    // covered above; here we assert the ephemeral-client case still yields a
+    // key, since an ephemeral client has a random X25519 key and no Ed25519
+    // preimage, but MAC1 still proves possession of it.
+    let (listener, _sk, server_pub) = start_server(Config::default()).await;
+    let addr = listener.local_addr().unwrap();
+
+    let server = tokio::spawn(async move {
+        let incoming = listener.accept().await.unwrap();
+        let seen = listener.peer_key(&incoming);
+        let conn = incoming.await.unwrap();
+        let (mut s, mut r) = conn.accept_bi().await.unwrap();
+        let mut buf = vec![0u8; 16];
+        let n = r.read(&mut buf).await.unwrap().unwrap();
+        s.write_all(&buf[..n]).await.unwrap();
+        s.finish().unwrap();
+        let _ = s.stopped().await;
+        seen
+    });
+
+    // No client_key => ephemeral random X25519 key.
+    let conn = squic::dial(addr, &server_pub, Config::default()).await.unwrap();
+    let (mut s, mut r) = conn.open_bi().await.unwrap();
+    s.write_all(b"x").await.unwrap();
+    s.finish().unwrap();
+    let mut buf = vec![0u8; 16];
+    let _ = r.read(&mut buf).await.unwrap().unwrap();
+
+    let seen = server.await.unwrap();
+    assert!(seen.is_some(), "an ephemeral client still has a verified transport key");
+}

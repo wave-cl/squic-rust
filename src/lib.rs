@@ -167,6 +167,24 @@ impl ServerListener {
         self.public_key
     }
 
+    /// The peer's X25519 public key for a connection being accepted, as
+    /// verified by MAC1 on its Initial packet — or `None` if none was
+    /// recorded.
+    ///
+    /// Pass the `Incoming` yielded by [`accept`](Self::accept); the key is
+    /// looked up by the connection's original destination CID and removed, so
+    /// a second call for the same connection returns `None`. `None` also
+    /// covers a peer that never passed MAC1 (there is none), a DCID contested
+    /// by two different keys, and an entry that expired before accept.
+    ///
+    /// This is the *transport* key. It is not the caller's Ed25519 identity
+    /// and cannot be converted to one — the Ed25519 → X25519 map is not
+    /// reversible. A caller that needs to authorise by Ed25519 key must hold
+    /// the forward mapping itself and match against it. See SIP-2.
+    pub fn peer_key(&self, incoming: &quinn::Incoming) -> Option<[u8; 32]> {
+        self.socket.take_peer_key(incoming.orig_dst_cid().as_ref())
+    }
+
     /// Add a client key to the whitelist.
     pub fn allow_key(&self, key: &[u8; 32]) {
         self.whitelist.allow_key(*key);

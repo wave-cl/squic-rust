@@ -9,12 +9,92 @@ use quinn::udp::{RecvMeta, Transmit, UdpSocketState};
 use quinn::AsyncUdpSocket;
 use std::io;
 use std::net::SocketAddr;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock, Weak};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::Interest;
 use x25519_dalek::{PublicKey as X25519Public, StaticSecret as X25519Secret};
+
+/// How long a validated peer key is retained before the connection is accepted.
+/// An Initial that passes MAC1 but whose handshake never completes would
+/// otherwise leave its key in the table for the life of the process; a peer
+/// that can pass MAC1 could fill it. The window only has to span the gap
+/// between the first Initial and `accept`, which is sub-second in practice.
+const PEER_KEY_TTL: Duration = Duration::from_secs(30);
+
+/// Above this many live entries, an insert first drops the expired ones. Keeps
+/// the table bounded without a background task; the bound is generous because
+/// each entry is tiny and the healthy steady state is near-empty.
+const PEER_TABLE_PRUNE_AT: usize = 512;
+
+struct PeerEntry {
+    key: [u8; 32],
+    inserted: Instant,
+    /// Two Initials shared this DCID with different keys. The connection can no
+    /// longer be attributed to one identity, so the entry answers for neither.
+    poisoned: bool,
+}
+
+/// Maps a QUIC Destination Connection ID to the peer X25519 key that MAC1
+/// verified on the Initial carrying it, so the accepting application can learn
+/// who it is talking to. See SIP-2.
+#[derive(Default)]
+struct PeerTable {
+    map: Mutex<HashMap<Vec<u8>, PeerEntry>>,
+}
+
+impl PeerTable {
+    /// Record `dcid -> key` for an Initial that just passed MAC1.
+    ///
+    /// A repeat of the same DCID with the same key is an ordinary
+    /// retransmission and refreshes the entry. A repeat with a *different* key
+    /// is a collision that cannot be resolved safely — an on-path attacker
+    /// could otherwise overwrite a victim's entry — so the entry is poisoned
+    /// and will answer for neither key.
+    fn record(&self, dcid: &[u8], key: [u8; 32], now: Instant) {
+        let mut map = self.map.lock().unwrap();
+        if map.len() >= PEER_TABLE_PRUNE_AT {
+            map.retain(|_, e| now.duration_since(e.inserted) < PEER_KEY_TTL);
+        }
+        match map.get_mut(dcid) {
+            Some(e) if e.poisoned => {}
+            Some(e) if e.key == key => e.inserted = now,
+            Some(e) => e.poisoned = true,
+            None => {
+                map.insert(
+                    dcid.to_vec(),
+                    PeerEntry { key, inserted: now, poisoned: false },
+                );
+            }
+        }
+    }
+
+    /// Remove and return the key for `dcid`, if one is recorded, not poisoned,
+    /// and not expired. Removing on read keeps the table draining as
+    /// connections are accepted.
+    fn take(&self, dcid: &[u8], now: Instant) -> Option<[u8; 32]> {
+        let mut map = self.map.lock().unwrap();
+        let entry = map.remove(dcid)?;
+        if entry.poisoned || now.duration_since(entry.inserted) >= PEER_KEY_TTL {
+            return None;
+        }
+        Some(entry.key)
+    }
+}
+
+/// The Destination Connection ID of a QUIC long-header (Initial) packet.
+///
+/// Layout: byte 0 flags, bytes 1..5 version, byte 5 DCID length (0..=20),
+/// bytes 6..6+len DCID. `is_quic_initial` has already checked the flags.
+fn initial_dcid(pkt: &[u8]) -> Option<&[u8]> {
+    let len = *pkt.get(5)? as usize;
+    if len > 20 {
+        return None;
+    }
+    pkt.get(6..6 + len)
+}
 
 /// Server-side UDP socket wrapper.
 /// Validates MAC1 on incoming Initial packets, silently drops invalid ones.
@@ -32,6 +112,8 @@ pub struct ServerSocket {
     cookie_replies: AtomicU64,
     mac2_verified: AtomicU64,
     load_threshold: u64,
+    /// DCID -> MAC1-verified peer key, drained by the application at accept.
+    peer_table: PeerTable,
 }
 
 impl ServerSocket {
@@ -66,6 +148,7 @@ impl ServerSocket {
             // Zero means the caller turned the cookie defence off; it is not a
             // stand-in for the default, which lib.rs has already applied.
             load_threshold,
+            peer_table: PeerTable::default(),
         }
     }
 
@@ -158,7 +241,22 @@ impl ServerSocket {
             return None;
         }
 
+        // MAC1 holds: this caller possesses the private key for `key`. Record
+        // it against the Initial's DCID so the application can recover the
+        // peer's identity at accept (SIP-2). `key` is the X25519 public key;
+        // it is not converted to Ed25519 here, because that map does not run
+        // backwards.
+        if let Some(dcid) = initial_dcid(&buf[..quic_len]) {
+            self.peer_table.record(dcid, key, Instant::now());
+        }
+
         Some(quic_len)
+    }
+
+    /// Remove and return the peer key recorded for `dcid`, if any. Called by
+    /// the listener when the application accepts a connection.
+    pub(crate) fn take_peer_key(&self, dcid: &[u8]) -> Option<[u8; 32]> {
+        self.peer_table.take(dcid, Instant::now())
     }
 
     fn send_cookie_reply(&self, addr: SocketAddr) {
@@ -793,5 +891,56 @@ mod tests {
         let len = envelope.len();
 
         assert_eq!(server.validate_and_strip(&mut envelope, len, Some(peer)), Some(1200));
+    }
+}
+
+#[cfg(test)]
+mod peer_table_tests {
+    use super::*;
+
+    #[test]
+    fn same_dcid_same_key_is_idempotent() {
+        let t = PeerTable::default();
+        let now = Instant::now();
+        t.record(b"cid1", [1u8; 32], now);
+        t.record(b"cid1", [1u8; 32], now); // retransmission
+        assert_eq!(t.take(b"cid1", now), Some([1u8; 32]));
+    }
+
+    #[test]
+    fn contested_dcid_is_poisoned_and_answers_for_neither() {
+        let t = PeerTable::default();
+        let now = Instant::now();
+        t.record(b"cid1", [1u8; 32], now);
+        t.record(b"cid1", [2u8; 32], now); // different key, same DCID
+        assert_eq!(t.take(b"cid1", now), None, "poisoned entry must not resolve");
+    }
+
+    #[test]
+    fn take_drains_the_entry() {
+        let t = PeerTable::default();
+        let now = Instant::now();
+        t.record(b"cid1", [1u8; 32], now);
+        assert_eq!(t.take(b"cid1", now), Some([1u8; 32]));
+        assert_eq!(t.take(b"cid1", now), None);
+    }
+
+    #[test]
+    fn expired_entry_does_not_resolve() {
+        let t = PeerTable::default();
+        let start = Instant::now();
+        t.record(b"cid1", [1u8; 32], start);
+        let later = start + PEER_KEY_TTL + Duration::from_secs(1);
+        assert_eq!(t.take(b"cid1", later), None);
+    }
+
+    #[test]
+    fn dcid_parsed_from_initial_header() {
+        // flags, 4-byte version, len=4, then 4-byte DCID, then payload.
+        let pkt = [0xC0, 0, 0, 0, 1, 4, 0xAA, 0xBB, 0xCC, 0xDD, 0x99];
+        assert_eq!(initial_dcid(&pkt), Some(&[0xAA, 0xBB, 0xCC, 0xDD][..]));
+        // Over-long length is rejected rather than trusted.
+        let bad = [0xC0, 0, 0, 0, 1, 21];
+        assert_eq!(initial_dcid(&bad), None);
     }
 }
