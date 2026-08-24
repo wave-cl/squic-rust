@@ -26,3 +26,33 @@ jobs:
 
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
+
+  cross-impl:
+    name: Cross-implementation peer-key test
+    runs-on: ubuntu-latest
+    steps:
+      # Both repos into sibling subdirs so the harness's default
+      # SQUIC_RUST_DIR (../squic-rust relative to squic-go) resolves.
+      - uses: actions/checkout@v4
+        with:
+          path: squic-rust
+      - uses: actions/checkout@v4
+        with:
+          repository: wave-cl/squic-go
+          path: squic-go
+
+      # squic-rust/rust-toolchain.toml pins the version; cargo auto-installs it.
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: squic-rust
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: squic-go/go.mod
+          cache: true
+          cache-dependency-path: squic-go/go.sum
+
+      # The harness lives in squic-go and drives both probes.
+      - name: Cross-implementation peer-key test
+        run: bash squic-go/scripts/cross_peerkey_test.sh
