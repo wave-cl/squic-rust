@@ -93,6 +93,13 @@ pub struct Config {
     /// When set, dial() uses this persistent identity instead of generating an ephemeral one.
     /// The client's X25519 public key is derived from this for MAC1 and whitelist matching.
     pub client_key: Option<String>,
+    /// SIP-3: advertise this client's Ed25519 identity in the Initial envelope,
+    /// so the server can report it at accept via `peer_identity()` without
+    /// having pre-registered the caller. Requires `client_key` (the identity to
+    /// advertise is derived from it); ignored otherwise. Default: `false` —
+    /// callers stay anonymous on the wire (the field is zeros) unless they opt
+    /// in, since the identity is server-visible plaintext.
+    pub advertise_identity: bool,
     /// DH operations per second before the server enters under-load mode and
     /// starts requiring a cookie (MAC2) from callers it has not challenged yet.
     /// Default: 1000. `Some(0)` disables the cookie defence entirely.
@@ -118,6 +125,7 @@ impl Default for Config {
             disable_active_migration: false,
             congestion_controller: CongestionController::Cubic,
             client_key: None,
+            advertise_identity: false,
             load_threshold: None,
         }
     }
@@ -172,17 +180,31 @@ impl ServerListener {
     /// recorded.
     ///
     /// Pass the `Incoming` yielded by [`accept`](Self::accept); the key is
-    /// looked up by the connection's original destination CID and removed, so
-    /// a second call for the same connection returns `None`. `None` also
-    /// covers a peer that never passed MAC1 (there is none), a DCID contested
-    /// by two different keys, and an entry that expired before accept.
+    /// looked up by the connection's original destination CID. `None` covers a
+    /// peer that never passed MAC1 (there is none), a DCID contested by two
+    /// different keys, and an entry that expired before accept. The lookup is a
+    /// peek, so [`peer_key`](Self::peer_key) and
+    /// [`peer_identity`](Self::peer_identity) may both be read for one
+    /// connection (SIP-2 + SIP-3).
     ///
-    /// This is the *transport* key. It is not the caller's Ed25519 identity
-    /// and cannot be converted to one — the Ed25519 → X25519 map is not
-    /// reversible. A caller that needs to authorise by Ed25519 key must hold
-    /// the forward mapping itself and match against it. See SIP-2.
+    /// This is the *transport* key. On its own it is not the caller's Ed25519
+    /// identity and cannot be reversed to one; a closed-set consumer forward-
+    /// matches known keys (SIP-2). For the Ed25519 name an unregistered caller
+    /// asserts, use [`peer_identity`](Self::peer_identity) (SIP-3).
     pub fn peer_key(&self, incoming: &quinn::Incoming) -> Option<[u8; 32]> {
-        self.socket.take_peer_key(incoming.orig_dst_cid().as_ref())
+        self.socket.peer_key(incoming.orig_dst_cid().as_ref())
+    }
+
+    /// The peer's MAC1-bound Ed25519 identity for a connection being accepted
+    /// (SIP-3), or `None` if the caller advertised none (the common, anonymous
+    /// case), the DCID was contested, or the entry expired.
+    ///
+    /// When present, the transport proved possession of the matching scalar and
+    /// the server checked that this Ed25519 key forward-derives to the verified
+    /// X25519 key — so an open-set service (e.g. a public exchange) may name and
+    /// authorise the caller by this key without having pre-registered it.
+    pub fn peer_identity(&self, incoming: &quinn::Incoming) -> Option<[u8; 32]> {
+        self.socket.peer_identity(incoming.orig_dst_cid().as_ref())
     }
 
     /// Add a client key to the whitelist.
@@ -336,22 +358,31 @@ pub async fn dial(
     server_pub_key: &[u8; 32],
     config: Config,
 ) -> Result<quinn::Connection, Error> {
-    // Derive or generate X25519 key pair
-    let (client_x25519_priv, client_x25519_pub) = if let Some(ref key_hex) = config.client_key {
-        // Persistent client identity: derive X25519 from Ed25519 seed
-        let seed = hex::decode(key_hex).map_err(|e| Error::Tls(format!("invalid client_key hex: {e}")))?;
-        if seed.len() != 32 {
-            return Err(Error::Tls(format!("client_key must be 32 bytes (got {})", seed.len())));
-        }
-        let signing_key = ed25519_dalek::SigningKey::from_bytes(&seed.try_into().unwrap());
-        let x25519_priv = ed25519_private_to_x25519(&signing_key);
-        let x25519_pub = X25519Public::from(&x25519_priv);
-        (x25519_priv, x25519_pub)
-    } else {
-        // Ephemeral: random X25519 key pair
-        let priv_key = x25519_dalek::StaticSecret::random_from_rng(rand_core::OsRng);
-        let pub_key = X25519Public::from(&priv_key);
-        (priv_key, pub_key)
+    // Derive or generate X25519 key pair, and the Ed25519 identity (if any) it
+    // came from — the latter can be advertised in the envelope (SIP-3).
+    let (client_x25519_priv, client_x25519_pub, client_ed25519_pub) =
+        if let Some(ref key_hex) = config.client_key {
+            // Persistent client identity: derive X25519 from Ed25519 seed
+            let seed = hex::decode(key_hex).map_err(|e| Error::Tls(format!("invalid client_key hex: {e}")))?;
+            if seed.len() != 32 {
+                return Err(Error::Tls(format!("client_key must be 32 bytes (got {})", seed.len())));
+            }
+            let signing_key = ed25519_dalek::SigningKey::from_bytes(&seed.try_into().unwrap());
+            let x25519_priv = ed25519_private_to_x25519(&signing_key);
+            let x25519_pub = X25519Public::from(&x25519_priv);
+            (x25519_priv, x25519_pub, Some(signing_key.verifying_key().to_bytes()))
+        } else {
+            // Ephemeral: random X25519 key pair, no Ed25519 identity to assert.
+            let priv_key = x25519_dalek::StaticSecret::random_from_rng(rand_core::OsRng);
+            let pub_key = X25519Public::from(&priv_key);
+            (priv_key, pub_key, None)
+        };
+
+    // SIP-3: the Ed25519 field to place in the envelope — the derived identity
+    // when opted in, otherwise all zeros ("no identity").
+    let advertise_ed25519 = match (config.advertise_identity, client_ed25519_pub) {
+        (true, Some(ed)) => ed,
+        _ => [0u8; 32],
     };
 
     // DH shared secret
@@ -371,8 +402,13 @@ pub async fn dial(
     let socket = Arc::new(tokio::net::UdpSocket::from_std(std_socket).map_err(Error::Io)?);
 
     let cookie_key = crate::mac::cookie_key(server_x25519_pub.as_bytes());
-    let client_socket =
-        ClientSocket::new(socket, shared, client_x25519_pub.to_bytes(), cookie_key);
+    let client_socket = ClientSocket::new(
+        socket,
+        shared,
+        client_x25519_pub.to_bytes(),
+        advertise_ed25519,
+        cookie_key,
+    );
 
     let tls_config = tls::client_tls_config(server_pub_key, &config.alpn_protocols)?;
     let quic_client_config: quinn_proto::crypto::rustls::QuicClientConfig = tls_config

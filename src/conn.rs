@@ -1,9 +1,10 @@
 use crate::mac::{
-    compute_mac1, compute_mac2, cookie_value, decrypt_cookie, encrypt_cookie, generate_nonce,
+    compute_mac1, compute_mac2, cookie_value, ct_eq, decrypt_cookie, encrypt_cookie, generate_nonce,
     is_quic_initial, now_timestamp, timestamp_in_window, verify_mac1, verify_mac2,
-    CLIENT_KEY_SIZE, COOKIE_REPLY_TYPE, COOKIE_SECRET_LIFETIME_SECS, MAC2_SIZE, MAC_OVERHEAD, MAC_SIZE,
-    NONCE_SIZE, TIMESTAMP_SIZE,
+    CLIENT_KEY_SIZE, COOKIE_REPLY_TYPE, COOKIE_SECRET_LIFETIME_SECS, ED25519_SIZE, MAC2_SIZE,
+    MAC_OVERHEAD, MAC_SIZE, NONCE_SIZE, TIMESTAMP_SIZE,
 };
+use crate::crypto::ed25519_identity_to_x25519;
 use crate::whitelist::Whitelist;
 use quinn::udp::{RecvMeta, Transmit, UdpSocketState};
 use quinn::AsyncUdpSocket;
@@ -31,9 +32,13 @@ const PEER_TABLE_PRUNE_AT: usize = 512;
 
 struct PeerEntry {
     key: [u8; 32],
+    /// The MAC1-bound Ed25519 identity (SIP-3), if the Initial carried one and it
+    /// forward-derived to `key`. `None` for an anonymous (zero-field) connection.
+    identity: Option<[u8; 32]>,
     inserted: Instant,
-    /// Two Initials shared this DCID with different keys. The connection can no
-    /// longer be attributed to one identity, so the entry answers for neither.
+    /// Two Initials shared this DCID with different keys or identities. The
+    /// connection can no longer be attributed to one identity, so the entry
+    /// answers for neither.
     poisoned: bool,
 }
 
@@ -53,34 +58,36 @@ impl PeerTable {
     /// is a collision that cannot be resolved safely — an on-path attacker
     /// could otherwise overwrite a victim's entry — so the entry is poisoned
     /// and will answer for neither key.
-    fn record(&self, dcid: &[u8], key: [u8; 32], now: Instant) {
+    fn record(&self, dcid: &[u8], key: [u8; 32], identity: Option<[u8; 32]>, now: Instant) {
         let mut map = self.map.lock().unwrap();
         if map.len() >= PEER_TABLE_PRUNE_AT {
             map.retain(|_, e| now.duration_since(e.inserted) < PEER_KEY_TTL);
         }
         match map.get_mut(dcid) {
             Some(e) if e.poisoned => {}
-            Some(e) if e.key == key => e.inserted = now,
+            Some(e) if e.key == key && e.identity == identity => e.inserted = now,
             Some(e) => e.poisoned = true,
             None => {
                 map.insert(
                     dcid.to_vec(),
-                    PeerEntry { key, inserted: now, poisoned: false },
+                    PeerEntry { key, identity, inserted: now, poisoned: false },
                 );
             }
         }
     }
 
-    /// Remove and return the key for `dcid`, if one is recorded, not poisoned,
-    /// and not expired. Removing on read keeps the table draining as
-    /// connections are accepted.
-    fn take(&self, dcid: &[u8], now: Instant) -> Option<[u8; 32]> {
-        let mut map = self.map.lock().unwrap();
-        let entry = map.remove(dcid)?;
+    /// Return the (key, identity) recorded for `dcid`, if one is present, not
+    /// poisoned, and not expired. This is a peek, not a drain: an application may
+    /// read the peer key and the peer identity separately for one connection
+    /// (SIP-2 + SIP-3), so both accessors must resolve. The table is bounded by
+    /// the TTL and the prune-on-insert instead.
+    fn get(&self, dcid: &[u8], now: Instant) -> Option<([u8; 32], Option<[u8; 32]>)> {
+        let map = self.map.lock().unwrap();
+        let entry = map.get(dcid)?;
         if entry.poisoned || now.duration_since(entry.inserted) >= PEER_KEY_TTL {
             return None;
         }
-        Some(entry.key)
+        Some((entry.key, entry.identity))
     }
 }
 
@@ -165,6 +172,8 @@ impl ServerSocket {
         let mut off = quic_len;
         let client_pub = &buf[off..off + CLIENT_KEY_SIZE];
         off += CLIENT_KEY_SIZE;
+        let ed25519 = &buf[off..off + ED25519_SIZE];
+        off += ED25519_SIZE;
         let ts_bytes = &buf[off..off + TIMESTAMP_SIZE];
         off += TIMESTAMP_SIZE;
         let nonce = &buf[off..off + NONCE_SIZE];
@@ -237,26 +246,54 @@ impl ServerSocket {
             return None;
         }
 
-        if !verify_mac1(shared.as_bytes(), &buf[..quic_len], timestamp, nonce, mac1) {
+        if !verify_mac1(shared.as_bytes(), &buf[..quic_len], ed25519, timestamp, nonce, mac1) {
             return None;
         }
 
-        // MAC1 holds: this caller possesses the private key for `key`. Record
-        // it against the Initial's DCID so the application can recover the
-        // peer's identity at accept (SIP-2). `key` is the X25519 public key;
-        // it is not converted to Ed25519 here, because that map does not run
-        // backwards.
+        // MAC1 holds: this caller possesses the private key for `key` (X25519),
+        // and the Ed25519 field is authenticated (it is in the MAC1 input).
+        //
+        // SIP-3: if the caller asserted an Ed25519 identity (nonzero field), it
+        // must forward-derive to the X25519 key MAC1 just proved. The map runs
+        // this way — Ed25519 -> X25519 is a function — even though it does not
+        // run backwards; the caller states which key is really its own and the
+        // server checks the statement with work it is already doing. A mismatch,
+        // a non-point key, or a small-order point fails the handshake rather
+        // than downgrading to anonymous (the peer must not get to choose that
+        // downgrade).
+        //
+        // All zeros means "no identity asserted". It is a *valid* point — the
+        // order-4 point, deriving to u = 1 — not an invalid encoding, so it is
+        // matched explicitly rather than left to fail the derivation.
+        let identity = if ed25519.iter().all(|&b| b == 0) {
+            None
+        } else {
+            let ed_arr: [u8; 32] = ed25519.try_into().expect("ED25519_SIZE == 32");
+            match ed25519_identity_to_x25519(&ed_arr) {
+                Ok(derived) if ct_eq(derived.as_bytes(), &key) => Some(ed_arr),
+                _ => return None,
+            }
+        };
+
+        // Record (X25519 key, Ed25519 identity) against the Initial's DCID so the
+        // application can recover the peer at accept (SIP-2 key, SIP-3 identity).
         if let Some(dcid) = initial_dcid(&buf[..quic_len]) {
-            self.peer_table.record(dcid, key, Instant::now());
+            self.peer_table.record(dcid, key, identity, Instant::now());
         }
 
         Some(quic_len)
     }
 
-    /// Remove and return the peer key recorded for `dcid`, if any. Called by
-    /// the listener when the application accepts a connection.
-    pub(crate) fn take_peer_key(&self, dcid: &[u8]) -> Option<[u8; 32]> {
-        self.peer_table.take(dcid, Instant::now())
+    /// The MAC1-verified peer X25519 key recorded for `dcid`, if any (SIP-2).
+    /// Called by the listener when the application accepts a connection.
+    pub(crate) fn peer_key(&self, dcid: &[u8]) -> Option<[u8; 32]> {
+        self.peer_table.get(dcid, Instant::now()).map(|(k, _)| k)
+    }
+
+    /// The MAC1-bound Ed25519 identity recorded for `dcid`, if the Initial
+    /// carried one that forward-derived to the peer key (SIP-3).
+    pub(crate) fn peer_identity(&self, dcid: &[u8]) -> Option<[u8; 32]> {
+        self.peer_table.get(dcid, Instant::now()).and_then(|(_, id)| id)
     }
 
     fn send_cookie_reply(&self, addr: SocketAddr) {
@@ -435,6 +472,9 @@ pub struct ClientSocket {
     inner: UdpSocketState,
     shared_secret: [u8; 32],
     client_pub_key: [u8; 32],
+    /// SIP-3: the Ed25519 identity advertised in the Initial envelope, or all
+    /// zeros to assert none. It forward-derives to `client_pub_key`.
+    advertise_ed25519: [u8; 32],
     cookie_key: [u8; 32], // decrypts cookie replies; derived from the server's public key
     handshake_done: AtomicBool, // true after first non-cookie packet received; skips the cookie scan
     cookie: RwLock<Option<[u8; 16]>>, // decrypted cookie from the server, keys MAC2
@@ -448,6 +488,7 @@ impl ClientSocket {
         socket: Arc<tokio::net::UdpSocket>,
         shared_secret: [u8; 32],
         client_pub_key: [u8; 32],
+        advertise_ed25519: [u8; 32],
         cookie_key: [u8; 32],
     ) -> Self {
         let inner = UdpSocketState::new((&*socket).into()).expect("UdpSocketState::new");
@@ -456,6 +497,7 @@ impl ClientSocket {
             inner,
             shared_secret,
             client_pub_key,
+            advertise_ed25519,
             cookie_key,
             handshake_done: AtomicBool::new(false),
             cookie: RwLock::new(None),
@@ -486,7 +528,7 @@ impl ClientSocket {
         // PERF NOTE: We bypass quinn-udp's UdpSocketState::send() here and
         // send the Initial packet as a raw datagram via try_send_to().
         //
-        // Why: The Initial packet is 1276 bytes (1200 QUIC + 76 MAC overhead),
+        // Why: The Initial packet is 1308 bytes (1200 QUIC + 108 MAC overhead),
         // which exceeds Quinn's normal 1200-byte segment size. On Linux with
         // GSO (Generic Segmentation Offload) enabled, quinn-udp's send() with
         // segment_size: None is ambiguous — it may attempt to segment the packet
@@ -557,10 +599,17 @@ impl ClientSocket {
     fn build_initial(&self, datagram: &[u8], cookie: Option<&[u8; 16]>) -> Vec<u8> {
         let ts = now_timestamp();
         let nonce = generate_nonce();
-        let mac1 = compute_mac1(&self.shared_secret, datagram, ts, &nonce);
+        let mac1 = compute_mac1(
+            &self.shared_secret,
+            datagram,
+            &self.advertise_ed25519,
+            ts,
+            &nonce,
+        );
         let mut buf = Vec::with_capacity(datagram.len() + MAC_OVERHEAD);
         buf.extend_from_slice(datagram);
         buf.extend_from_slice(&self.client_pub_key);
+        buf.extend_from_slice(&self.advertise_ed25519);
         buf.extend_from_slice(&ts.to_be_bytes());
         buf.extend_from_slice(&nonce);
         buf.extend_from_slice(&mac1);
@@ -738,6 +787,7 @@ mod tests {
             socket().await,
             shared,
             client_pub.to_bytes(),
+            [0u8; 32], // advertise no Ed25519 identity (random X25519 test key)
             cookie_key(server_pub.as_bytes()),
         );
         (server, client)
@@ -846,13 +896,15 @@ mod tests {
         // The attacker assumes the exchange yields zeros, and is right.
         let assumed_shared = [0u8; 32];
 
+        let ed = [0u8; 32];
         let ts = now_timestamp();
         let nonce = generate_nonce();
-        let mac1 = compute_mac1(&assumed_shared, &datagram, ts, &nonce);
+        let mac1 = compute_mac1(&assumed_shared, &datagram, &ed, ts, &nonce);
 
         let mut buf = Vec::new();
         buf.extend_from_slice(&datagram);
         buf.extend_from_slice(&zero_key);
+        buf.extend_from_slice(&ed);
         buf.extend_from_slice(&ts.to_be_bytes());
         buf.extend_from_slice(&nonce);
         buf.extend_from_slice(&mac1);
@@ -902,36 +954,47 @@ mod peer_table_tests {
     fn same_dcid_same_key_is_idempotent() {
         let t = PeerTable::default();
         let now = Instant::now();
-        t.record(b"cid1", [1u8; 32], now);
-        t.record(b"cid1", [1u8; 32], now); // retransmission
-        assert_eq!(t.take(b"cid1", now), Some([1u8; 32]));
+        t.record(b"cid1", [1u8; 32], Some([9u8; 32]), now);
+        t.record(b"cid1", [1u8; 32], Some([9u8; 32]), now); // retransmission
+        assert_eq!(t.get(b"cid1", now), Some(([1u8; 32], Some([9u8; 32]))));
     }
 
     #[test]
     fn contested_dcid_is_poisoned_and_answers_for_neither() {
         let t = PeerTable::default();
         let now = Instant::now();
-        t.record(b"cid1", [1u8; 32], now);
-        t.record(b"cid1", [2u8; 32], now); // different key, same DCID
-        assert_eq!(t.take(b"cid1", now), None, "poisoned entry must not resolve");
+        t.record(b"cid1", [1u8; 32], None, now);
+        t.record(b"cid1", [2u8; 32], None, now); // different key, same DCID
+        assert_eq!(t.get(b"cid1", now), None, "poisoned entry must not resolve");
     }
 
     #[test]
-    fn take_drains_the_entry() {
+    fn contested_identity_is_also_poisoned() {
         let t = PeerTable::default();
         let now = Instant::now();
-        t.record(b"cid1", [1u8; 32], now);
-        assert_eq!(t.take(b"cid1", now), Some([1u8; 32]));
-        assert_eq!(t.take(b"cid1", now), None);
+        t.record(b"cid1", [1u8; 32], Some([9u8; 32]), now);
+        t.record(b"cid1", [1u8; 32], Some([8u8; 32]), now); // same key, different identity
+        assert_eq!(t.get(b"cid1", now), None);
+    }
+
+    #[test]
+    fn get_is_a_peek_not_a_drain() {
+        // SIP-2 peer_key and SIP-3 peer_identity are read separately for one
+        // connection, so a read must not remove the entry.
+        let t = PeerTable::default();
+        let now = Instant::now();
+        t.record(b"cid1", [1u8; 32], None, now);
+        assert_eq!(t.get(b"cid1", now), Some(([1u8; 32], None)));
+        assert_eq!(t.get(b"cid1", now), Some(([1u8; 32], None)));
     }
 
     #[test]
     fn expired_entry_does_not_resolve() {
         let t = PeerTable::default();
         let start = Instant::now();
-        t.record(b"cid1", [1u8; 32], start);
+        t.record(b"cid1", [1u8; 32], None, start);
         let later = start + PEER_KEY_TTL + Duration::from_secs(1);
-        assert_eq!(t.take(b"cid1", later), None);
+        assert_eq!(t.get(b"cid1", later), None);
     }
 
     #[test]

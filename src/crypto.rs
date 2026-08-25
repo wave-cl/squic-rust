@@ -49,6 +49,28 @@ pub fn ed25519_public_to_x25519(ed_pub: &[u8; 32]) -> Result<X25519Public, crate
     Ok(X25519Public::from(montgomery.to_bytes()))
 }
 
+/// The strict form of [`ed25519_public_to_x25519`], for an Ed25519 key a *peer*
+/// asserts as its identity (SIP-3).
+///
+/// It additionally rejects small-order points. Every 32-byte string that
+/// decompresses is some curve point — including all zeros, which is the order-4
+/// point `(±i, 0)` and maps to the Montgomery key `u = 1` — so the map alone
+/// cannot tell an identity from a degenerate value. A genuine public key `aB`
+/// lies in the prime-order subgroup and is never small-order, so refusing
+/// torsion here costs an honest caller nothing and keeps this check sound on its
+/// own, rather than relying on the DH's non-contributory check having run first.
+pub fn ed25519_identity_to_x25519(ed_pub: &[u8; 32]) -> Result<X25519Public, crate::Error> {
+    let compressed = CompressedEdwardsY(*ed_pub);
+    let point = compressed
+        .decompress()
+        .ok_or(crate::Error::InvalidKey("invalid Ed25519 public key"))?;
+    if point.is_small_order() {
+        return Err(crate::Error::InvalidKey("small-order Ed25519 identity"));
+    }
+    let montgomery = point.to_montgomery();
+    Ok(X25519Public::from(montgomery.to_bytes()))
+}
+
 /// Perform X25519 Diffie-Hellman.
 /// Diffie-Hellman, refusing a non-contributory exchange.
 ///
@@ -91,6 +113,31 @@ mod tests {
         let (key2, pub2) = load_keypair(&hex_seed).unwrap();
         assert_eq!(pub1, pub2);
         assert_eq!(key1.to_bytes(), key2.to_bytes());
+    }
+
+    /// The strict identity map (SIP-3) must refuse torsion. All zeros is the
+    /// case that matters: it is a *valid* order-4 point, not an invalid
+    /// encoding, so the permissive map happily returns u = 1 for it.
+    #[test]
+    fn identity_map_refuses_small_order() {
+        let zeros = [0u8; 32];
+        // The permissive map accepts it and yields the Montgomery point u = 1.
+        let loose = ed25519_public_to_x25519(&zeros).expect("zeros decompress");
+        let mut u1 = [0u8; 32];
+        u1[0] = 1;
+        assert_eq!(loose.to_bytes(), u1, "all-zero Ed25519 maps to u = 1");
+        // The strict map refuses it.
+        assert!(ed25519_identity_to_x25519(&zeros).is_err());
+    }
+
+    /// A genuine key is in the prime-order subgroup, so the strict map accepts
+    /// it and agrees with the permissive one.
+    #[test]
+    fn identity_map_accepts_a_real_key() {
+        let (_sk, pub_bytes) = generate_keypair();
+        let strict = ed25519_identity_to_x25519(&pub_bytes).expect("real key accepted");
+        let loose = ed25519_public_to_x25519(&pub_bytes).unwrap();
+        assert_eq!(strict.to_bytes(), loose.to_bytes());
     }
 
     #[test]

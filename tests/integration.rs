@@ -253,13 +253,15 @@ async fn test_initial_packet_arrives_fast() {
     let _ = server_task.await;
 }
 
-/// Verify MAC_OVERHEAD is the expected 76 bytes at runtime.
+/// Verify MAC_OVERHEAD is the expected 108 bytes at runtime (SIP-3 added the
+/// 32-byte Ed25519 identity field).
 #[test]
-fn test_mac_overhead_is_76() {
-    assert_eq!(squic::mac::MAC_OVERHEAD, 76);
+fn test_mac_overhead_is_108() {
+    assert_eq!(squic::mac::MAC_OVERHEAD, 108);
     assert_eq!(
         squic::mac::MAC_OVERHEAD,
         squic::mac::CLIENT_KEY_SIZE
+            + squic::mac::ED25519_SIZE
             + squic::mac::TIMESTAMP_SIZE
             + squic::mac::NONCE_SIZE
             + squic::mac::MAC_SIZE
@@ -570,7 +572,8 @@ async fn test_peer_key_matches_dialing_client() {
         let incoming = listener.accept().await.unwrap();
         // The verified peer key is available before the handshake completes.
         let seen = listener.peer_key(&incoming);
-        // A second call for the same connection drains to None.
+        // The lookup is a peek (SIP-3 needs peer_key and peer_identity both
+        // readable for one connection), so a second call still resolves.
         let seen_again = listener.peer_key(&incoming);
         let conn = incoming.await.unwrap();
         let (mut s, mut r) = conn.accept_bi().await.unwrap();
@@ -595,7 +598,91 @@ async fn test_peer_key_matches_dialing_client() {
 
     let (seen, seen_again) = server.await.unwrap();
     assert_eq!(seen, Some(expected), "peer key must match the dialing client");
-    assert_eq!(seen_again, None, "the entry must drain on read");
+    assert_eq!(seen_again, Some(expected), "peek must resolve repeatedly");
+}
+
+/// SIP-3: a client that opts in carries its Ed25519 identity in the Initial, and
+/// the server reports it at accept via `peer_identity()` — with no prior
+/// registration of that caller. `peer_key` still resolves too.
+#[tokio::test]
+async fn test_peer_identity_is_reported_when_advertised() {
+    use ed25519_dalek::SigningKey;
+    let client_seed = [7u8; 32];
+    let client_signing = SigningKey::from_bytes(&client_seed);
+    let expected_ed = client_signing.verifying_key().to_bytes();
+
+    let (listener, _sk, server_pub) = start_server(Config::default()).await;
+    let addr = listener.local_addr().unwrap();
+
+    let server = tokio::spawn(async move {
+        let incoming = listener.accept().await.unwrap();
+        let key = listener.peer_key(&incoming);
+        let id = listener.peer_identity(&incoming);
+        let conn = incoming.await.unwrap();
+        let (mut s, mut r) = conn.accept_bi().await.unwrap();
+        let mut buf = vec![0u8; 16];
+        let n = r.read(&mut buf).await.unwrap().unwrap();
+        s.write_all(&buf[..n]).await.unwrap();
+        s.finish().unwrap();
+        let _ = s.stopped().await;
+        (key, id)
+    });
+
+    let client_cfg = Config {
+        client_key: Some(client_seed.iter().map(|b| format!("{b:02x}")).collect()),
+        advertise_identity: true,
+        ..Default::default()
+    };
+    let conn = squic::dial(addr, &server_pub, client_cfg).await.unwrap();
+    let (mut s, mut r) = conn.open_bi().await.unwrap();
+    s.write_all(b"x").await.unwrap();
+    s.finish().unwrap();
+    let mut buf = vec![0u8; 16];
+    let _ = r.read(&mut buf).await.unwrap().unwrap();
+
+    let (key, id) = server.await.unwrap();
+    assert!(key.is_some(), "peer key must still be present");
+    assert_eq!(id, Some(expected_ed), "advertised Ed25519 identity reported at accept");
+}
+
+/// SIP-3 is opt-in: a client that does not advertise (the default) is anonymous
+/// on the wire — `peer_identity` is `None` though `peer_key` still resolves.
+#[tokio::test]
+async fn test_peer_identity_absent_by_default() {
+    let client_seed = [7u8; 32];
+
+    let (listener, _sk, server_pub) = start_server(Config::default()).await;
+    let addr = listener.local_addr().unwrap();
+
+    let server = tokio::spawn(async move {
+        let incoming = listener.accept().await.unwrap();
+        let key = listener.peer_key(&incoming);
+        let id = listener.peer_identity(&incoming);
+        let conn = incoming.await.unwrap();
+        let (mut s, mut r) = conn.accept_bi().await.unwrap();
+        let mut buf = vec![0u8; 16];
+        let n = r.read(&mut buf).await.unwrap().unwrap();
+        s.write_all(&buf[..n]).await.unwrap();
+        s.finish().unwrap();
+        let _ = s.stopped().await;
+        (key, id)
+    });
+
+    let client_cfg = Config {
+        client_key: Some(client_seed.iter().map(|b| format!("{b:02x}")).collect()),
+        // advertise_identity defaults to false
+        ..Default::default()
+    };
+    let conn = squic::dial(addr, &server_pub, client_cfg).await.unwrap();
+    let (mut s, mut r) = conn.open_bi().await.unwrap();
+    s.write_all(b"x").await.unwrap();
+    s.finish().unwrap();
+    let mut buf = vec![0u8; 16];
+    let _ = r.read(&mut buf).await.unwrap().unwrap();
+
+    let (key, id) = server.await.unwrap();
+    assert!(key.is_some(), "peer key present");
+    assert_eq!(id, None, "no identity advertised, so none reported");
 }
 
 #[tokio::test]

@@ -10,6 +10,10 @@ pub const MAC_SIZE: usize = 16;
 /// Size of an X25519 public key.
 pub const CLIENT_KEY_SIZE: usize = 32;
 
+/// Size of the carried Ed25519 identity key (SIP-3). All-zero means "no
+/// identity asserted".
+pub const ED25519_SIZE: usize = 32;
+
 /// Size of the replay-protection timestamp (uint32 epoch seconds).
 pub const TIMESTAMP_SIZE: usize = 4;
 
@@ -19,14 +23,16 @@ pub const MAC2_SIZE: usize = 16;
 /// Size of the random nonce in bytes.
 pub const NONCE_SIZE: usize = 8;
 
-/// Total overhead appended to Initial packets:
-/// 32-byte client X25519 public key + 4-byte timestamp + 8-byte nonce + 16-byte MAC1 + 16-byte MAC2.
-pub const MAC_OVERHEAD: usize = CLIENT_KEY_SIZE + TIMESTAMP_SIZE + NONCE_SIZE + MAC_SIZE + MAC2_SIZE;
+/// Total overhead appended to Initial packets (SIP-3):
+/// 32-byte client X25519 public key + 32-byte Ed25519 identity + 4-byte
+/// timestamp + 8-byte nonce + 16-byte MAC1 + 16-byte MAC2.
+pub const MAC_OVERHEAD: usize =
+    CLIENT_KEY_SIZE + ED25519_SIZE + TIMESTAMP_SIZE + NONCE_SIZE + MAC_SIZE + MAC2_SIZE;
 
-// Static assertion: MAC_OVERHEAD must be 76 bytes (32+4+8+16+16).
+// Static assertion: MAC_OVERHEAD must be 108 bytes (32+32+4+8+16+16).
 // If this changes, update ClientSocket::try_send() which bypasses quinn-udp
 // for the oversized Initial packet to avoid GSO issues on Linux.
-const _: () = assert!(MAC_OVERHEAD == 76, "MAC_OVERHEAD changed — update Initial send path in conn.rs");
+const _: () = assert!(MAC_OVERHEAD == 108, "MAC_OVERHEAD changed — update Initial send path in conn.rs");
 
 /// First byte of a cookie reply packet.
 pub const COOKIE_REPLY_TYPE: u8 = 0x01;
@@ -45,11 +51,25 @@ pub const COOKIE_SECRET_LIFETIME_SECS: u64 = 120;
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// Compute MAC1 = HMAC-SHA256(shared_secret, data || timestamp || nonce)[:16]
-pub fn compute_mac1(shared_secret: &[u8], data: &[u8], timestamp: u32, nonce: &[u8]) -> [u8; MAC_SIZE] {
+/// Compute MAC1 = HMAC-SHA256(shared_secret, data || ed25519 || timestamp || nonce)[:16]
+///
+/// SIP-3: the carried Ed25519 identity field is part of the MAC1 input. This is
+/// load-bearing — it does not feed the shared secret, so if it were left
+/// unauthenticated an on-path attacker could substitute the sign-conjugate key
+/// (which passes the server's derivation check) and flip the reported identity.
+/// `ed25519` is the 32-byte field exactly as it appears on the wire (all zeros
+/// when no identity is asserted).
+pub fn compute_mac1(
+    shared_secret: &[u8],
+    data: &[u8],
+    ed25519: &[u8],
+    timestamp: u32,
+    nonce: &[u8],
+) -> [u8; MAC_SIZE] {
     let mut mac =
         <HmacSha256 as Mac>::new_from_slice(shared_secret).expect("HMAC accepts any key size");
     mac.update(data);
+    mac.update(ed25519);
     mac.update(&timestamp.to_be_bytes());
     mac.update(nonce);
     let result = mac.finalize().into_bytes();
@@ -59,9 +79,22 @@ pub fn compute_mac1(shared_secret: &[u8], data: &[u8], timestamp: u32, nonce: &[
 }
 
 /// Verify MAC1 with constant-time comparison.
-pub fn verify_mac1(shared_secret: &[u8], data: &[u8], timestamp: u32, nonce: &[u8], mac1: &[u8]) -> bool {
-    let expected = compute_mac1(shared_secret, data, timestamp, nonce);
+pub fn verify_mac1(
+    shared_secret: &[u8],
+    data: &[u8],
+    ed25519: &[u8],
+    timestamp: u32,
+    nonce: &[u8],
+    mac1: &[u8],
+) -> bool {
+    let expected = compute_mac1(shared_secret, data, ed25519, timestamp, nonce);
     constant_time_eq(&expected, mac1)
+}
+
+/// Constant-time equality over two byte slices (public helper for the SIP-3
+/// identity-derivation check in conn.rs).
+pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    constant_time_eq(a, b)
 }
 
 /// Generate a cryptographically random 8-byte nonce using the kernel CSPRNG.
@@ -194,27 +227,33 @@ mod tests {
     fn test_mac1_round_trip() {
         let secret = [0xABu8; 32];
         let data = b"test packet data";
+        let ed = [0x11u8; ED25519_SIZE];
         let ts = now_timestamp();
         let nonce = generate_nonce();
-        let mac = compute_mac1(&secret, data, ts, &nonce);
+        let mac = compute_mac1(&secret, data, &ed, ts, &nonce);
         assert_eq!(mac.len(), MAC_SIZE);
-        assert!(verify_mac1(&secret, data, ts, &nonce, &mac));
+        assert!(verify_mac1(&secret, data, &ed, ts, &nonce, &mac));
 
         // Wrong key
         let wrong = [0xCDu8; 32];
-        assert!(!verify_mac1(&wrong, data, ts, &nonce, &mac));
+        assert!(!verify_mac1(&wrong, data, &ed, ts, &nonce, &mac));
 
         // Tampered data
         let mut tampered = data.to_vec();
         tampered[0] ^= 0xFF;
-        assert!(!verify_mac1(&secret, &tampered, ts, &nonce, &mac));
+        assert!(!verify_mac1(&secret, &tampered, &ed, ts, &nonce, &mac));
+
+        // Tampered Ed25519 identity field (SIP-3: it is in the MAC1 input)
+        let mut ed2 = ed;
+        ed2[0] ^= 0xFF;
+        assert!(!verify_mac1(&secret, data, &ed2, ts, &nonce, &mac));
 
         // Wrong timestamp
-        assert!(!verify_mac1(&secret, data, ts + 1, &nonce, &mac));
+        assert!(!verify_mac1(&secret, data, &ed, ts + 1, &nonce, &mac));
 
         // Wrong nonce
         let wrong_nonce = generate_nonce();
-        assert!(!verify_mac1(&secret, data, ts, &wrong_nonce, &mac));
+        assert!(!verify_mac1(&secret, data, &ed, ts, &wrong_nonce, &mac));
     }
 
     #[test]

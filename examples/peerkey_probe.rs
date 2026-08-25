@@ -1,12 +1,17 @@
-//! Cross-implementation probe for the SIP-2 peer-key accessor.
+//! Cross-implementation probe for the SIP-2 peer-key and SIP-3 peer-identity
+//! accessors.
 //!
 //! server: load a fixed keypair, accept one connection, print the peer key the
-//!         transport verified as `PEERKEY=<hex>`, then complete the handshake.
+//!         transport verified as `PEERKEY=<hex>` and the Ed25519 identity it
+//!         bound as `PEERID=<hex>` (or `PEERID=none`), then complete the
+//!         handshake.
 //! client: dial with a fixed client key and print the X25519 key it will send
-//!         as `CLIENTX=<hex>`.
+//!         as `CLIENTX=<hex>`, plus the Ed25519 identity it advertises as
+//!         `CLIENTED=<hex>` — or `CLIENTED=none` without `--advertise`.
 //!
 //! A harness runs this against the Go probe in every client/server combination
-//! and asserts every PEERKEY equals every CLIENTX.
+//! and asserts every PEERKEY equals every CLIENTX, and every PEERID equals
+//! every CLIENTED (which covers both the advertised and the anonymous case).
 use clap::Parser;
 use squic::{self, Config};
 use std::net::SocketAddr;
@@ -30,6 +35,9 @@ struct Args {
     /// Client Ed25519 seed (hex) — client mode.
     #[arg(long)]
     client_key: Option<String>,
+    /// Advertise the client's Ed25519 identity in the envelope (SIP-3).
+    #[arg(long)]
+    advertise: bool,
 }
 
 #[tokio::main]
@@ -58,6 +66,10 @@ async fn run_server(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         Some(k) => println!("PEERKEY={}", hex::encode(k)),
         None => println!("PEERKEY=none"),
     }
+    match listener.peer_identity(&incoming) {
+        Some(id) => println!("PEERID={}", hex::encode(id)),
+        None => println!("PEERID=none"),
+    }
     std::io::stdout().flush()?;
     // Complete the handshake so the client does not error out.
     let conn = incoming.await?;
@@ -78,17 +90,27 @@ async fn run_client(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         .try_into()
         .map_err(|_| "server-pub must be 32 bytes")?;
 
-    // Print the X25519 key this client will stamp into its Initial.
-    let (sk, _) = squic::load_keypair(&seed)?;
+    // Print the X25519 key this client will stamp into its Initial, and the
+    // Ed25519 identity it will advertise (or `none`).
+    let (sk, ed_pub) = squic::load_keypair(&seed)?;
     let x = squic::crypto::ed25519_private_to_x25519(&sk);
     let xpub = x25519_dalek::PublicKey::from(&x);
     println!("CLIENTX={}", hex::encode(xpub.to_bytes()));
+    if args.advertise {
+        println!("CLIENTED={}", hex::encode(ed_pub));
+    } else {
+        println!("CLIENTED=none");
+    }
 
     let addr: SocketAddr = format!("{}:{}", args.host, args.port).parse()?;
     let conn = squic::dial(
         addr,
         &server_pub,
-        Config { client_key: Some(seed), ..Default::default() },
+        Config {
+            client_key: Some(seed),
+            advertise_identity: args.advertise,
+            ..Default::default()
+        },
     )
     .await?;
     let (mut send, mut recv) = conn.open_bi().await?;

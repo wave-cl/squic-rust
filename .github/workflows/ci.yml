@@ -28,7 +28,7 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
 
   cross-impl:
-    name: Cross-implementation peer-key test
+    name: Cross-implementation peer-key / peer-identity test
     runs-on: ubuntu-latest
     steps:
       # Both repos into sibling subdirs so the harness's default
@@ -53,6 +53,10 @@ jobs:
           cache: true
           cache-dependency-path: squic-go/go.sum
 
-      # The harness lives in squic-go and drives both probes.
-      - name: Cross-implementation peer-key test
+      # The harness lives in squic-go and drives both probes. It covers the
+      # SIP-2 peer key and the SIP-3 peer identity, advertised and anonymous.
+      # NOTE: this checks out the sibling repo's default branch, so during a
+      # wire flag-day (SIP-3) it fails until BOTH mains carry the change —
+      # re-run after the second push.
+      - name: Cross-implementation peer-key / peer-identity test
         run: bash squic-go/scripts/cross_peerkey_test.sh
