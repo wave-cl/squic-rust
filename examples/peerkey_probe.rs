@@ -9,6 +9,12 @@
 //!         as `CLIENTX=<hex>`, plus the Ed25519 identity it advertises as
 //!         `CLIENTED=<hex>` — or `CLIENTED=none` without `--advertise`.
 //!
+//! With --under-load the server demands a cookie (SIP-7) from every caller
+//! before doing any key agreement, and reports the defence's counters as
+//! `COOKIES=<replies sent>,<MAC2 verified>` — so a harness can tell a
+//! connection that went through the cookie exchange from one that merely
+//! succeeded.
+//!
 //! A harness runs this against the Go probe in every client/server combination
 //! and asserts every PEERKEY equals every CLIENTX, and every PEERID equals
 //! every CLIENTED (which covers both the advertised and the anonymous case).
@@ -38,6 +44,10 @@ struct Args {
     /// Advertise the client's Ed25519 identity in the envelope (SIP-3).
     #[arg(long)]
     advertise: bool,
+    /// Start the server in under-load mode, so every caller is challenged for
+    /// a cookie before the Diffie-Hellman (SIP-7) — server mode.
+    #[arg(long)]
+    under_load: bool,
 }
 
 #[tokio::main]
@@ -60,6 +70,9 @@ async fn run_server(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     std::io::stdout().flush()?;
     let addr: SocketAddr = format!("127.0.0.1:{}", args.port).parse()?;
     let listener = squic::listen(addr, &signing_key, Config::default()).await?;
+    if args.under_load {
+        listener.set_under_load(true);
+    }
 
     let incoming = listener.accept().await.ok_or("no connection")?;
     match listener.peer_key(&incoming) {
@@ -70,6 +83,11 @@ async fn run_server(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         Some(id) => println!("PEERID={}", hex::encode(id)),
         None => println!("PEERID=none"),
     }
+    let stats = listener.load_stats();
+    println!(
+        "COOKIES={},{}",
+        stats.cookie_replies_sent, stats.mac2_verified
+    );
     std::io::stdout().flush()?;
     // Complete the handshake so the client does not error out.
     let conn = incoming.await?;

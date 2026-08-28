@@ -28,7 +28,7 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
 
   cross-impl:
-    name: Cross-implementation peer-key / peer-identity test
+    name: Cross-implementation tests
     runs-on: ubuntu-latest
     steps:
       # Both repos into sibling subdirs so the harness's default
@@ -60,3 +60,10 @@ jobs:
       # re-run after the second push.
       - name: Cross-implementation peer-key / peer-identity test
         run: bash squic-go/scripts/cross_peerkey_test.sh
+
+      # Covers the SIP-7 cookie defence across the same matrix: the cookie
+      # value, the cookie-reply key, the reply packet and the MAC2 boundary.
+      # These are four constructions both ends must compute identically and,
+      # until this ran, each had only ever been checked against itself.
+      - name: Cross-implementation cookie test
+        run: bash squic-go/scripts/cross_cookie_test.sh
