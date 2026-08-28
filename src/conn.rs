@@ -103,6 +103,12 @@ fn initial_dcid(pkt: &[u8]) -> Option<&[u8]> {
     pkt.get(6..6 + len)
 }
 
+/// A QUIC short header: header-form bit clear, fixed bit set. Everything after
+/// the handshake looks like this, and nothing before it does.
+fn is_short_header(data: &[u8]) -> bool {
+    !data.is_empty() && data[0] & 0xC0 == 0x40
+}
+
 /// Server-side UDP socket wrapper.
 /// Validates MAC1 on incoming Initial packets, silently drops invalid ones.
 pub struct ServerSocket {
@@ -641,6 +647,18 @@ impl AsyncUdpSocket for ClientSocket {
         // Hot path: short-header packets, which is everything after the
         // handshake. One byte test, no atomics.
         if !is_quic_initial(transmit.contents) {
+            // A short header means 1-RTT keys, which means the handshake
+            // finished — and only then can there be no further cookie
+            // challenge, because only an Initial is ever challenged. This is
+            // where the receive side's fast path is armed. Arming it on the
+            // receive side instead, at the first batch containing no cookie,
+            // was wrong: the very first packet back from the server clears it,
+            // and a server that then enters under-load mode mid-handshake
+            // challenges an Initial whose reply the client has stopped
+            // reading, so the connection stalls until it times out.
+            if is_short_header(transmit.contents) {
+                self.handshake_done.store(true, Ordering::Relaxed);
+            }
             return self.io.try_io(Interest::WRITABLE, || {
                 self.inner.send((&*self.io).into(), transmit)
             });
@@ -675,33 +693,22 @@ impl AsyncUdpSocket for ClientSocket {
                     return Poll::Ready(Ok(count));
                 }
 
-                // Check for cookie replies — store them, mark for removal
-                let mut is_cookie = [false; 64]; // stack array, max GRO batch size
-                let mut any_cookie = false;
+                // Take out the cookie replies and compact what is left, in one
+                // pass. Testing the type byte again during compaction is
+                // cheaper than the flags array this used to carry, which was
+                // fixed at 64 entries against a batch size that is quinn-udp's
+                // to choose — safe at its current 32, and a panic if it ever
+                // grew.
+                let mut valid = 0;
                 for i in 0..count {
                     let len = metas[i].len;
                     if len > 0 && bufs[i][0] == COOKIE_REPLY_TYPE {
                         self.store_cookie(&bufs[i][1..len]);
-                        is_cookie[i] = true;
-                        any_cookie = true;
-                    }
-                }
-
-                // If no cookies in this batch, handshake is done — set fast path
-                if !any_cookie {
-                    self.handshake_done.store(true, Ordering::Relaxed);
-                    return Poll::Ready(Ok(count));
-                }
-
-                // Compact non-cookie packets
-                let mut valid = 0;
-                for i in 0..count {
-                    if is_cookie[i] {
                         continue;
                     }
                     if valid != i {
                         metas[valid] = metas[i];
-                        let src_len = metas[valid].len;
+                        let src_len = metas[i].len;
                         let (left, right) = bufs.split_at_mut(i);
                         left[valid][..src_len].copy_from_slice(&right[0][..src_len]);
                     }
@@ -1005,5 +1012,36 @@ mod peer_table_tests {
         // Over-long length is rejected rather than trusted.
         let bad = [0xC0, 0, 0, 0, 1, 21];
         assert_eq!(initial_dcid(&bad), None);
+    }
+}
+
+#[cfg(test)]
+mod short_header_tests {
+    use super::*;
+
+    /// The client stops watching for cookie replies when it sends its first
+    /// 1-RTT packet, so this test decides when that happens. Getting it wrong
+    /// in one direction leaves the fast path permanently disarmed; in the other
+    /// it disarms the cookie path during the handshake, which is the stall this
+    /// classification was introduced to fix.
+    #[test]
+    fn classifies_quic_headers() {
+        // Short header: header-form clear, fixed bit set. 1-RTT, and only 1-RTT.
+        assert!(is_short_header(&[0x40]));
+        assert!(is_short_header(&[0x7F]));
+
+        // Long headers, whatever their packet type — Initial, 0-RTT, Handshake,
+        // Retry — all have the header-form bit set.
+        for first in [0xC0u8, 0xD0, 0xE0, 0xF0] {
+            assert!(!is_short_header(&[first]), "long header {first:#04x}");
+        }
+
+        // A cookie reply is neither, which is what lets it share the socket.
+        assert!(!is_short_header(&[COOKIE_REPLY_TYPE]));
+        assert!(!is_quic_initial(&[COOKIE_REPLY_TYPE, 0, 0, 0, 0]));
+
+        // Fixed bit clear is not a QUIC packet at all.
+        assert!(!is_short_header(&[0x00]));
+        assert!(!is_short_header(&[]));
     }
 }
