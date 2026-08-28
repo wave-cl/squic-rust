@@ -106,12 +106,15 @@ pub struct Config {
     pub load_threshold: Option<u64>,
     /// SIP-29: the envelope version this client emits.
     ///
-    /// Default: `ENVELOPE_V1`, deliberately, and **not** the newest version
-    /// this crate implements. A client that defaulted to the newest would
-    /// break every deployment that upgraded a client before a server — which
-    /// is exactly the flag day the version marker exists to remove. Set it to
-    /// `ENVELOPE_V2` once the servers you talk to accept it; a later release
-    /// will move the default.
+    /// Default: `ENVELOPE_V2` as of v0.18.0. It was `ENVELOPE_V1` from v0.17.0,
+    /// which is the discipline SIP-29 requires — a release that introduces a
+    /// version ships clients still sending the previous one, so that upgrading
+    /// a client before a server cannot break anything, and a later release
+    /// moves the default once servers have had time to deploy. This is that
+    /// later release.
+    ///
+    /// Set it back to `ENVELOPE_V1` if you still talk to a server older than
+    /// squic v0.17.0, which will drop a version 2 Initial in silence.
     pub envelope_version: u8,
     /// SIP-29: the envelope versions this server parses.
     ///
@@ -143,7 +146,7 @@ impl Default for Config {
             client_key: None,
             advertise_identity: false,
             load_threshold: None,
-            envelope_version: crate::mac::ENVELOPE_V1,
+            envelope_version: crate::mac::ENVELOPE_V2,
             accepted_envelope_versions: vec![crate::mac::ENVELOPE_V1, crate::mac::ENVELOPE_V2],
         }
     }

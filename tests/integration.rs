@@ -950,3 +950,21 @@ async fn wait_for_mac2(listener: &squic::ServerListener, want: u64) -> u64 {
     }
     listener.load_stats().mac2_verified
 }
+
+/// SIP-29's Sending rule in two parts. A release that *introduces* a version
+/// ships clients still sending the previous one, so upgrading a client before a
+/// server cannot break anything; a later release moves the default once servers
+/// have deployed. This is that later release, so the default is version 2 — and
+/// a server still accepts version 1, because retiring it is a separate decision
+/// a deployment makes for itself.
+#[test]
+fn the_client_default_is_version_2_and_servers_still_accept_version_1() {
+    let config = Config::default();
+    assert_eq!(config.envelope_version, squic::mac::ENVELOPE_V2);
+    assert!(config
+        .accepted_envelope_versions
+        .contains(&squic::mac::ENVELOPE_V1));
+    assert!(config
+        .accepted_envelope_versions
+        .contains(&squic::mac::ENVELOPE_V2));
+}
