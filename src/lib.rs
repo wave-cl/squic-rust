@@ -104,6 +104,22 @@ pub struct Config {
     /// starts requiring a cookie (MAC2) from callers it has not challenged yet.
     /// Default: 1000. `Some(0)` disables the cookie defence entirely.
     pub load_threshold: Option<u64>,
+    /// SIP-29: the envelope version this client emits.
+    ///
+    /// Default: `ENVELOPE_V1`, deliberately, and **not** the newest version
+    /// this crate implements. A client that defaulted to the newest would
+    /// break every deployment that upgraded a client before a server — which
+    /// is exactly the flag day the version marker exists to remove. Set it to
+    /// `ENVELOPE_V2` once the servers you talk to accept it; a later release
+    /// will move the default.
+    pub envelope_version: u8,
+    /// SIP-29: the envelope versions this server parses.
+    ///
+    /// Default: both, so a server can be upgraded without waiting for its
+    /// clients. Drop `ENVELOPE_V1` to retire it — which a deployment MUST be
+    /// able to do, or the oldest envelope ever defined becomes a permanent
+    /// floor.
+    pub accepted_envelope_versions: Vec<u8>,
 }
 
 impl Default for Config {
@@ -127,6 +143,8 @@ impl Default for Config {
             client_key: None,
             advertise_identity: false,
             load_threshold: None,
+            envelope_version: crate::mac::ENVELOPE_V1,
+            accepted_envelope_versions: vec![crate::mac::ENVELOPE_V1, crate::mac::ENVELOPE_V2],
         }
     }
 }
@@ -322,6 +340,7 @@ pub async fn listen(
         server_x25519_priv,
         whitelist.clone(),
         load_threshold,
+        config.accepted_envelope_versions.clone(),
     ));
     ServerSocket::spawn_maintenance(&server_socket);
 
@@ -415,6 +434,7 @@ pub async fn dial(
         client_x25519_pub.to_bytes(),
         advertise_ed25519,
         cookie_key,
+        config.envelope_version,
     );
 
     let tls_config = tls::client_tls_config(server_pub_key, &config.alpn_protocols)?;

@@ -1,7 +1,8 @@
 use crate::mac::{
     compute_mac1, compute_mac2, cookie_value, ct_eq, decrypt_cookie, encrypt_cookie, generate_nonce,
-    is_quic_initial, now_timestamp, timestamp_in_window, verify_mac1, verify_mac2,
-    CLIENT_KEY_SIZE, COOKIE_REPLY_TYPE, COOKIE_SECRET_LIFETIME_SECS, ED25519_SIZE, MAC2_SIZE,
+    is_quic_initial, now_timestamp, timestamp_in_window, trailer_len, verify_mac1, verify_mac2,
+    CLIENT_KEY_SIZE, COOKIE_REPLY_TYPE, COOKIE_SECRET_LIFETIME_SECS, ED25519_SIZE, ENVELOPE_V1,
+    MAC2_SIZE,
     MAC_OVERHEAD, MAC_SIZE, NONCE_SIZE, TIMESTAMP_SIZE,
 };
 use crate::crypto::ed25519_identity_to_x25519;
@@ -109,6 +110,16 @@ fn is_short_header(data: &[u8]) -> bool {
     !data.is_empty() && data[0] & 0xC0 == 0x40
 }
 
+/// What one envelope-version attempt concluded (SIP-29).
+///
+/// `Challenge` is reported rather than acted on, so that trying two layouts for
+/// one datagram cannot send the caller two cookie replies.
+enum Outcome {
+    Accepted(usize),
+    Challenge,
+    Drop,
+}
+
 /// Server-side UDP socket wrapper.
 /// Validates MAC1 on incoming Initial packets, silently drops invalid ones.
 pub struct ServerSocket {
@@ -125,6 +136,8 @@ pub struct ServerSocket {
     cookie_replies: AtomicU64,
     mac2_verified: AtomicU64,
     load_threshold: u64,
+    /// Envelope versions this server parses (SIP-29).
+    accepted_versions: Vec<u8>,
     /// DCID -> MAC1-verified peer key, drained by the application at accept.
     peer_table: PeerTable,
 }
@@ -135,6 +148,7 @@ impl ServerSocket {
         server_x25519_priv: X25519Secret,
         whitelist: Arc<Whitelist>,
         load_threshold: u64,
+        accepted_versions: Vec<u8>,
     ) -> Self {
         let inner = UdpSocketState::new((&*socket).into()).expect("UdpSocketState::new");
         let cookie_key = crate::mac::cookie_key(
@@ -161,20 +175,77 @@ impl ServerSocket {
             // Zero means the caller turned the cookie defence off; it is not a
             // stand-in for the default, which lib.rs has already applied.
             load_threshold,
+            accepted_versions,
             peer_table: PeerTable::default(),
         }
     }
 
+    /// Dispatch an Initial on its envelope version (SIP-29) and validate it.
+    ///
+    /// The version marker is the **last byte of the datagram**, which is the
+    /// only place a receiver can read without already knowing the trailer's
+    /// width — and knowing the width is what the marker is for. Version 1
+    /// predates the marker and carries none, so it is the fallback: its last
+    /// byte is the last byte of MAC2, uniformly random, and names version 2
+    /// about once in 256 packets. That costs one wasted parse before the
+    /// fallback succeeds, and nothing at all for the other 255.
     fn validate_and_strip(&self, buf: &mut [u8], len: usize, addr: Option<SocketAddr>) -> Option<usize> {
         if !is_quic_initial(&buf[..len]) {
             return Some(len); // non-Initial passes through
         }
 
-        if len <= MAC_OVERHEAD {
-            return None; // too short
+        let marked = buf[len - 1];
+        let mut challenge = false;
+
+        // A marked version, if we accept it and it is not the unmarked one.
+        if marked != ENVELOPE_V1 && self.accepts(marked) {
+            match self.try_version(marked, buf, len, addr) {
+                Outcome::Accepted(quic_len) => return Some(quic_len),
+                Outcome::Challenge => challenge = true,
+                Outcome::Drop => {}
+            }
         }
 
-        let quic_len = len - MAC_OVERHEAD;
+        // Then the unmarked form, which is the only version that needs guessing.
+        if self.accepts(ENVELOPE_V1) {
+            match self.try_version(ENVELOPE_V1, buf, len, addr) {
+                Outcome::Accepted(quic_len) => return Some(quic_len),
+                Outcome::Challenge => challenge = true,
+                Outcome::Drop => {}
+            }
+        }
+
+        // At most one challenge per datagram, however many layouts were tried.
+        if challenge && let Some(a) = addr {
+            self.send_cookie_reply(a);
+        }
+        None
+    }
+
+    /// Whether this server parses `version`.
+    fn accepts(&self, version: u8) -> bool {
+        self.accepted_versions.contains(&version)
+    }
+
+    /// Validate one Initial under one envelope version.
+    ///
+    /// Returns `Challenge` rather than sending the cookie reply itself, so that
+    /// trying two layouts cannot challenge the same caller twice.
+    fn try_version(
+        &self,
+        version: u8,
+        buf: &[u8],
+        len: usize,
+        addr: Option<SocketAddr>,
+    ) -> Outcome {
+        let Some(trailer) = trailer_len(version) else {
+            return Outcome::Drop;
+        };
+        if len <= trailer {
+            return Outcome::Drop; // too short
+        }
+
+        let quic_len = len - trailer;
         let mut off = quic_len;
         let client_pub = &buf[off..off + CLIENT_KEY_SIZE];
         off += CLIENT_KEY_SIZE;
@@ -187,13 +258,13 @@ impl ServerSocket {
         let mac1_start = off;
         let mac1 = &buf[off..off + MAC_SIZE];
         off += MAC_SIZE;
-        let mac2 = &buf[off..len];
+        let mac2 = &buf[off..off + MAC2_SIZE];
 
         let timestamp = u32::from_be_bytes([ts_bytes[0], ts_bytes[1], ts_bytes[2], ts_bytes[3]]);
 
         // Step 1: Replay protection (cheap)
         if !timestamp_in_window(timestamp, now_timestamp()) {
-            return None;
+            return Outcome::Drop;
         }
 
         // Step 2: MAC2 check — if under load, require valid MAC2
@@ -222,11 +293,7 @@ impl ServerSocket {
             if mac2_valid {
                 self.mac2_verified.fetch_add(1, Ordering::Relaxed);
             } else {
-                // Send cookie reply and drop
-                if let Some(a) = addr {
-                    self.send_cookie_reply(a);
-                }
-                return None;
+                return Outcome::Challenge;
             }
         }
 
@@ -234,7 +301,7 @@ impl ServerSocket {
         let mut key = [0u8; 32];
         key.copy_from_slice(client_pub);
         if !self.whitelist.is_allowed(&key) {
-            return None;
+            return Outcome::Drop;
         }
 
         // Step 4: DH + MAC1 verification (expensive)
@@ -249,15 +316,26 @@ impl ServerSocket {
         // outright for any deployment without a whitelist, and it is the
         // whitelist — not this check — that has been carrying us.
         if !shared.was_contributory() {
-            return None;
+            return Outcome::Drop;
         }
 
-        if !verify_mac1(shared.as_bytes(), &buf[..quic_len], ed25519, timestamp, nonce, mac1) {
-            return None;
+        if !verify_mac1(
+            version,
+            shared.as_bytes(),
+            &buf[..quic_len],
+            ed25519,
+            timestamp,
+            nonce,
+            mac1,
+        ) {
+            return Outcome::Drop;
         }
 
         // MAC1 holds: this caller possesses the private key for `key` (X25519),
-        // and the Ed25519 field is authenticated (it is in the MAC1 input).
+        // and the Ed25519 field is authenticated (it is in the MAC1 input). So
+        // is the version marker, which SIP-29 prefixes to that input — a peer
+        // that tampered with it produces a tag over a different layout, which
+        // is why a flipped marker can only cost a drop and never an accept.
         //
         // SIP-3: if the caller asserted an Ed25519 identity (nonzero field), it
         // must forward-derive to the X25519 key MAC1 just proved. The map runs
@@ -277,7 +355,7 @@ impl ServerSocket {
             let ed_arr: [u8; 32] = ed25519.try_into().expect("ED25519_SIZE == 32");
             match ed25519_identity_to_x25519(&ed_arr) {
                 Ok(derived) if ct_eq(derived.as_bytes(), &key) => Some(ed_arr),
-                _ => return None,
+                _ => return Outcome::Drop,
             }
         };
 
@@ -287,7 +365,7 @@ impl ServerSocket {
             self.peer_table.record(dcid, key, identity, Instant::now());
         }
 
-        Some(quic_len)
+        Outcome::Accepted(quic_len)
     }
 
     /// The MAC1-verified peer X25519 key recorded for `dcid`, if any (SIP-2).
@@ -492,6 +570,10 @@ pub struct ClientSocket {
     /// SIP-3: the Ed25519 identity advertised in the Initial envelope, or all
     /// zeros to assert none. It forward-derives to `client_pub_key`.
     advertise_ed25519: [u8; 32],
+    /// SIP-29: the envelope version this client emits. One version per
+    /// connection attempt, never a fallback — the server is silent, so a
+    /// timeout would say nothing about which version it wanted.
+    envelope_version: u8,
     cookie_key: [u8; 32], // decrypts cookie replies; derived from the server's public key
     handshake_done: AtomicBool, // true after first non-cookie packet received; skips the cookie scan
     cookie: RwLock<Option<[u8; 16]>>, // decrypted cookie from the server, keys MAC2
@@ -507,6 +589,7 @@ impl ClientSocket {
         client_pub_key: [u8; 32],
         advertise_ed25519: [u8; 32],
         cookie_key: [u8; 32],
+        envelope_version: u8,
     ) -> Self {
         let inner = UdpSocketState::new((&*socket).into()).expect("UdpSocketState::new");
         Self {
@@ -515,6 +598,7 @@ impl ClientSocket {
             shared_secret,
             client_pub_key,
             advertise_ed25519,
+            envelope_version,
             cookie_key,
             handshake_done: AtomicBool::new(false),
             cookie: RwLock::new(None),
@@ -617,13 +701,14 @@ impl ClientSocket {
         let ts = now_timestamp();
         let nonce = generate_nonce();
         let mac1 = compute_mac1(
+            self.envelope_version,
             &self.shared_secret,
             datagram,
             &self.advertise_ed25519,
             ts,
             &nonce,
         );
-        let mut buf = Vec::with_capacity(datagram.len() + MAC_OVERHEAD);
+        let mut buf = Vec::with_capacity(datagram.len() + MAC_OVERHEAD + 1);
         buf.extend_from_slice(datagram);
         buf.extend_from_slice(&self.client_pub_key);
         buf.extend_from_slice(&self.advertise_ed25519);
@@ -643,6 +728,14 @@ impl ClientSocket {
                 buf.extend_from_slice(&mac2);
             }
             None => buf.extend_from_slice(&[0u8; MAC2_SIZE]),
+        }
+
+        // SIP-29: the marker goes last, after MAC2, because that is the only
+        // offset a receiver can find without already knowing the trailer's
+        // width. Version 1 predates it and emits nothing, which is what keeps
+        // this client able to talk to a server that has not moved yet.
+        if self.envelope_version != ENVELOPE_V1 {
+            buf.push(self.envelope_version);
         }
         buf
     }
@@ -779,14 +872,24 @@ use std::task::ready;
 mod tests {
     use super::*;
     use crate::crypto::{ed25519_private_to_x25519, x25519};
-    use crate::mac::cookie_key;
+    use crate::mac::{cookie_key, ENVELOPE_V2};
 
     async fn socket() -> Arc<tokio::net::UdpSocket> {
         Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap())
     }
 
-    /// Build a matched client and server over loopback sockets.
+    /// Build a matched client and server over loopback sockets, with the
+    /// client emitting version 1 and the server accepting both (SIP-29).
     async fn pair() -> (ServerSocket, ClientSocket) {
+        pair_with(ENVELOPE_V1, vec![ENVELOPE_V1, ENVELOPE_V2]).await
+    }
+
+    /// As `pair`, choosing which envelope version the client emits and which
+    /// the server will parse.
+    async fn pair_with(
+        client_version: u8,
+        server_versions: Vec<u8>,
+    ) -> (ServerSocket, ClientSocket) {
         let (signing_key, _) = crate::crypto::generate_keypair();
         let server_priv = ed25519_private_to_x25519(&signing_key);
         let server_pub = X25519Public::from(&server_priv);
@@ -800,6 +903,7 @@ mod tests {
             server_priv,
             Arc::new(Whitelist::new(None)),
             1000,
+            server_versions,
         );
         let client = ClientSocket::new(
             socket().await,
@@ -807,6 +911,7 @@ mod tests {
             client_pub.to_bytes(),
             [0u8; 32], // advertise no Ed25519 identity (random X25519 test key)
             cookie_key(server_pub.as_bytes()),
+            client_version,
         );
         (server, client)
     }
@@ -917,7 +1022,7 @@ mod tests {
         let ed = [0u8; 32];
         let ts = now_timestamp();
         let nonce = generate_nonce();
-        let mac1 = compute_mac1(&assumed_shared, &datagram, &ed, ts, &nonce);
+        let mac1 = compute_mac1(ENVELOPE_V1, &assumed_shared, &datagram, &ed, ts, &nonce);
 
         let mut buf = Vec::new();
         buf.extend_from_slice(&datagram);
@@ -961,6 +1066,108 @@ mod tests {
         let len = envelope.len();
 
         assert_eq!(server.validate_and_strip(&mut envelope, len, Some(peer)), Some(1200));
+    }
+
+
+    const DATAGRAM: usize = 1200;
+
+    fn initial() -> Vec<u8> {
+        vec![0xC0u8; DATAGRAM]
+    }
+
+    /// A version 2 client and a server that accepts version 2 agree on the
+    /// whole envelope: the marker's position, the trailer's width, and the
+    /// version prefix in MAC1.
+    #[tokio::test]
+    async fn version_2_round_trips() {
+        let (server, client) = pair_with(ENVELOPE_V2, vec![ENVELOPE_V1, ENVELOPE_V2]).await;
+        let mut envelope = client.build_initial(&initial(), None);
+        assert_eq!(envelope.len(), DATAGRAM + MAC_OVERHEAD + 1);
+        assert_eq!(*envelope.last().unwrap(), ENVELOPE_V2, "marker is not last");
+
+        let len = envelope.len();
+        assert_eq!(
+            server.validate_and_strip(&mut envelope, len, None),
+            Some(DATAGRAM)
+        );
+    }
+
+    /// The transition case, and the reason this SIP is worth having: one server
+    /// serving both versions at once.
+    #[tokio::test]
+    async fn a_server_serves_both_versions_at_once() {
+        for version in [ENVELOPE_V1, ENVELOPE_V2] {
+            let (server, client) = pair_with(version, vec![ENVELOPE_V1, ENVELOPE_V2]).await;
+            let mut envelope = client.build_initial(&initial(), None);
+            let len = envelope.len();
+            assert_eq!(
+                server.validate_and_strip(&mut envelope, len, None),
+                Some(DATAGRAM),
+                "server accepting both refused version {version}"
+            );
+        }
+    }
+
+    /// A version 1 packet's last byte is the last byte of MAC2. With no cookie
+    /// that is deterministically zero — the reserved version, never a marker —
+    /// so the collision only arises for a packet carrying a real MAC2, which
+    /// means one issued under load. Forced here, because one in 256 is not a
+    /// thing to leave to chance in a test.
+    #[tokio::test]
+    async fn a_version_1_packet_naming_version_2_still_gets_through() {
+        let (server, client) = pair_with(ENVELOPE_V1, vec![ENVELOPE_V1, ENVELOPE_V2]).await;
+        let mut envelope = client.build_initial(&initial(), None);
+        assert_eq!(*envelope.last().unwrap(), 0, "no cookie should mean a zero tail");
+
+        // Now make it look like a version 2 marker. Not under load, so MAC2's
+        // contents are never examined and only the dispatch changes.
+        *envelope.last_mut().unwrap() = ENVELOPE_V2;
+        let len = envelope.len();
+        assert_eq!(
+            server.validate_and_strip(&mut envelope, len, None),
+            Some(DATAGRAM),
+            "the version 1 fallback did not rescue a packet that named version 2"
+        );
+    }
+
+    /// A deployment must be able to retire a version, or the oldest envelope
+    /// ever defined is a permanent floor.
+    #[tokio::test]
+    async fn a_server_can_retire_version_1() {
+        let (server, client) = pair_with(ENVELOPE_V1, vec![ENVELOPE_V2]).await;
+        let mut envelope = client.build_initial(&initial(), None);
+        let len = envelope.len();
+        assert_eq!(
+            server.validate_and_strip(&mut envelope, len, None),
+            None,
+            "a server that retired version 1 still accepted it"
+        );
+    }
+
+    /// And a server that has not learned version 2 refuses it, which is the
+    /// direction that does not interoperate and the reason for servers-first.
+    #[tokio::test]
+    async fn a_version_1_server_refuses_version_2() {
+        let (server, client) = pair_with(ENVELOPE_V2, vec![ENVELOPE_V1]).await;
+        let mut envelope = client.build_initial(&initial(), None);
+        let len = envelope.len();
+        assert_eq!(server.validate_and_strip(&mut envelope, len, None), None);
+    }
+
+    /// The marker is read before it is authenticated. Tampering with it must
+    /// cost a drop and never an accept: MAC1 covers it as a prefix, so a
+    /// flipped marker is a tag over a layout the sender never used.
+    #[tokio::test]
+    async fn a_flipped_marker_is_dropped() {
+        let (server, client) = pair_with(ENVELOPE_V2, vec![ENVELOPE_V1, ENVELOPE_V2]).await;
+        let mut envelope = client.build_initial(&initial(), None);
+        *envelope.last_mut().unwrap() = 7; // a version nobody defines
+        let len = envelope.len();
+        assert_eq!(
+            server.validate_and_strip(&mut envelope, len, None),
+            None,
+            "an unknown marker was accepted"
+        );
     }
 }
 

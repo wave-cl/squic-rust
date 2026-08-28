@@ -737,7 +737,7 @@ fn forge_initial(
     let ed = [0u8; 32]; // no identity asserted
     let ts = squic::mac::now_timestamp();
     let nonce = squic::mac::generate_nonce();
-    let mac1 = squic::mac::compute_mac1(shared, &datagram, &ed, ts, &nonce);
+    let mac1 = squic::mac::compute_mac1(squic::mac::ENVELOPE_V1, shared, &datagram, &ed, ts, &nonce);
 
     let mut buf = datagram;
     buf.extend_from_slice(client_x25519_pub);

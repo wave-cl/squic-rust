@@ -23,16 +23,43 @@ pub const MAC2_SIZE: usize = 16;
 /// Size of the random nonce in bytes.
 pub const NONCE_SIZE: usize = 8;
 
-/// Total overhead appended to Initial packets (SIP-3):
+/// Total overhead appended to Initial packets by envelope version 1 (SIP-6):
 /// 32-byte client X25519 public key + 32-byte Ed25519 identity + 4-byte
 /// timestamp + 8-byte nonce + 16-byte MAC1 + 16-byte MAC2.
 pub const MAC_OVERHEAD: usize =
     CLIENT_KEY_SIZE + ED25519_SIZE + TIMESTAMP_SIZE + NONCE_SIZE + MAC_SIZE + MAC2_SIZE;
 
-// Static assertion: MAC_OVERHEAD must be 108 bytes (32+32+4+8+16+16).
-// If this changes, update ClientSocket::try_send() which bypasses quinn-udp
-// for the oversized Initial packet to avoid GSO issues on Linux.
+/// Envelope version 1 (SIP-6): no marker byte on the wire. It is named so that
+/// a receiver supporting both has something to call the unmarked form.
+pub const ENVELOPE_V1: u8 = 1;
+
+/// Envelope version 2 (SIP-29): version 1 plus a one-byte marker, last.
+pub const ENVELOPE_V2: u8 = 2;
+
+/// Size of the version marker.
+pub const VERSION_SIZE: usize = 1;
+
+/// Trailer width for envelope version 2.
+pub const MAC_OVERHEAD_V2: usize = MAC_OVERHEAD + VERSION_SIZE;
+
+// Static assertions: the version 1 trailer is 108 bytes (32+32+4+8+16+16) and
+// version 2 is one more. If either changes, update ClientSocket::try_send(),
+// which bypasses quinn-udp for the oversized Initial packet to avoid GSO issues
+// on Linux.
 const _: () = assert!(MAC_OVERHEAD == 108, "MAC_OVERHEAD changed — update Initial send path in conn.rs");
+const _: () = assert!(MAC_OVERHEAD_V2 == 109, "MAC_OVERHEAD_V2 changed — update Initial send path in conn.rs");
+
+/// The trailer width for an envelope version, or `None` if unknown.
+///
+/// SIP-29: version 0 is reserved and never emitted, so a zero byte is known not
+/// to be a marker.
+pub fn trailer_len(version: u8) -> Option<usize> {
+    match version {
+        ENVELOPE_V1 => Some(MAC_OVERHEAD),
+        ENVELOPE_V2 => Some(MAC_OVERHEAD_V2),
+        _ => None,
+    }
+}
 
 /// First byte of a cookie reply packet.
 pub const COOKIE_REPLY_TYPE: u8 = 0x01;
@@ -60,6 +87,7 @@ type HmacSha256 = Hmac<Sha256>;
 /// `ed25519` is the 32-byte field exactly as it appears on the wire (all zeros
 /// when no identity is asserted).
 pub fn compute_mac1(
+    version: u8,
     shared_secret: &[u8],
     data: &[u8],
     ed25519: &[u8],
@@ -68,6 +96,18 @@ pub fn compute_mac1(
 ) -> [u8; MAC_SIZE] {
     let mut mac =
         <HmacSha256 as Mac>::new_from_slice(shared_secret).expect("HMAC accepts any key size");
+    // SIP-29: every marked version prefixes its version byte. Version 1
+    // predates the marker and prefixes nothing.
+    //
+    // A prefix rather than a suffix, because it is doing two jobs. It
+    // authenticates the marker, which a receiver has to read before it can
+    // verify anything. And because it comes first, tags computed under
+    // different versions are unrelated even when the remaining input
+    // coincides — so a packet valid under one version can never verify under
+    // another, whatever an attacker picks for the rest of the envelope.
+    if version != ENVELOPE_V1 {
+        mac.update(&[version]);
+    }
     mac.update(data);
     mac.update(ed25519);
     mac.update(&timestamp.to_be_bytes());
@@ -80,6 +120,7 @@ pub fn compute_mac1(
 
 /// Verify MAC1 with constant-time comparison.
 pub fn verify_mac1(
+    version: u8,
     shared_secret: &[u8],
     data: &[u8],
     ed25519: &[u8],
@@ -87,7 +128,7 @@ pub fn verify_mac1(
     nonce: &[u8],
     mac1: &[u8],
 ) -> bool {
-    let expected = compute_mac1(shared_secret, data, ed25519, timestamp, nonce);
+    let expected = compute_mac1(version, shared_secret, data, ed25519, timestamp, nonce);
     constant_time_eq(&expected, mac1)
 }
 
@@ -230,30 +271,88 @@ mod tests {
         let ed = [0x11u8; ED25519_SIZE];
         let ts = now_timestamp();
         let nonce = generate_nonce();
-        let mac = compute_mac1(&secret, data, &ed, ts, &nonce);
+        let mac = compute_mac1(ENVELOPE_V1, &secret, data, &ed, ts, &nonce);
         assert_eq!(mac.len(), MAC_SIZE);
-        assert!(verify_mac1(&secret, data, &ed, ts, &nonce, &mac));
+        assert!(verify_mac1(ENVELOPE_V1, &secret, data, &ed, ts, &nonce, &mac));
 
         // Wrong key
         let wrong = [0xCDu8; 32];
-        assert!(!verify_mac1(&wrong, data, &ed, ts, &nonce, &mac));
+        assert!(!verify_mac1(ENVELOPE_V1, &wrong, data, &ed, ts, &nonce, &mac));
 
         // Tampered data
         let mut tampered = data.to_vec();
         tampered[0] ^= 0xFF;
-        assert!(!verify_mac1(&secret, &tampered, &ed, ts, &nonce, &mac));
+        assert!(!verify_mac1(ENVELOPE_V1, &secret, &tampered, &ed, ts, &nonce, &mac));
 
         // Tampered Ed25519 identity field (SIP-3: it is in the MAC1 input)
         let mut ed2 = ed;
         ed2[0] ^= 0xFF;
-        assert!(!verify_mac1(&secret, data, &ed2, ts, &nonce, &mac));
+        assert!(!verify_mac1(ENVELOPE_V1, &secret, data, &ed2, ts, &nonce, &mac));
 
         // Wrong timestamp
-        assert!(!verify_mac1(&secret, data, &ed, ts + 1, &nonce, &mac));
+        assert!(!verify_mac1(ENVELOPE_V1, &secret, data, &ed, ts + 1, &nonce, &mac));
 
         // Wrong nonce
         let wrong_nonce = generate_nonce();
-        assert!(!verify_mac1(&secret, data, &ed, ts, &wrong_nonce, &mac));
+        assert!(!verify_mac1(ENVELOPE_V1, &secret, data, &ed, ts, &wrong_nonce, &mac));
+    }
+
+    /// SIP-29 prefixes the version to the MAC1 input rather than appending it,
+    /// so that tags computed under different versions are unrelated even when
+    /// everything after the prefix is identical. Without that separation a
+    /// packet valid under one version could be made to verify under another.
+    #[test]
+    fn mac1_is_bound_to_the_envelope_version() {
+        let secret = [0xABu8; 32];
+        let data = b"one QUIC Initial";
+        let ed = [0u8; ED25519_SIZE];
+        let ts = now_timestamp();
+        let nonce = generate_nonce();
+
+        let v1 = compute_mac1(ENVELOPE_V1, &secret, data, &ed, ts, &nonce);
+        let v2 = compute_mac1(ENVELOPE_V2, &secret, data, &ed, ts, &nonce);
+        assert_ne!(v1, v2, "the version is not in the MAC1 input");
+
+        // Neither verifies as the other, which is what makes the two forms
+        // unambiguous cryptographically and not merely structurally.
+        assert!(!verify_mac1(ENVELOPE_V2, &secret, data, &ed, ts, &nonce, &v1));
+        assert!(!verify_mac1(ENVELOPE_V1, &secret, data, &ed, ts, &nonce, &v2));
+        assert!(verify_mac1(ENVELOPE_V1, &secret, data, &ed, ts, &nonce, &v1));
+        assert!(verify_mac1(ENVELOPE_V2, &secret, data, &ed, ts, &nonce, &v2));
+    }
+
+    /// Version 1 predates the marker, so its MAC1 must be exactly what SIP-6
+    /// specified — no prefix. A peer that started prefixing version 1 would
+    /// break every deployment still on it.
+    #[test]
+    fn version_1_mac1_carries_no_prefix() {
+        let secret = [0x11u8; 32];
+        let data = b"payload";
+        let ed = [0u8; ED25519_SIZE];
+        let ts = 1234u32;
+        let nonce = [7u8; NONCE_SIZE];
+
+        let mut expected = <HmacSha256 as Mac>::new_from_slice(&secret).unwrap();
+        expected.update(data);
+        expected.update(&ed);
+        expected.update(&ts.to_be_bytes());
+        expected.update(&nonce);
+        let expected = expected.finalize().into_bytes();
+
+        let got = compute_mac1(ENVELOPE_V1, &secret, data, &ed, ts, &nonce);
+        assert_eq!(&got[..], &expected[..MAC_SIZE]);
+    }
+
+    #[test]
+    fn trailer_len_knows_only_defined_versions() {
+        assert_eq!(trailer_len(ENVELOPE_V1), Some(MAC_OVERHEAD));
+        assert_eq!(trailer_len(ENVELOPE_V2), Some(MAC_OVERHEAD_V2));
+        assert_eq!(trailer_len(ENVELOPE_V2), Some(MAC_OVERHEAD + 1));
+        // Version 0 is reserved and never emitted, so a zero byte is known not
+        // to be a marker.
+        assert_eq!(trailer_len(0), None);
+        assert_eq!(trailer_len(3), None);
+        assert_eq!(trailer_len(255), None);
     }
 
     #[test]
@@ -281,7 +380,7 @@ mod tests {
         let ed = [0u8; ED25519_SIZE];
         let ts = now_timestamp();
         let nonce = generate_nonce();
-        let mac1 = compute_mac1(&shared, datagram, &ed, ts, &nonce);
+        let mac1 = compute_mac1(ENVELOPE_V1, &shared, datagram, &ed, ts, &nonce);
 
         let mut buf = Vec::new();
         buf.extend_from_slice(datagram);

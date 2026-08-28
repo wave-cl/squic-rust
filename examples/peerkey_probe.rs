@@ -48,6 +48,9 @@ struct Args {
     /// a cookie before the Diffie-Hellman (SIP-7) — server mode.
     #[arg(long)]
     under_load: bool,
+    /// Envelope version to emit (SIP-29) — client mode. Servers accept both.
+    #[arg(long, default_value = "1")]
+    envelope_version: u8,
 }
 
 #[tokio::main]
@@ -114,6 +117,7 @@ async fn run_client(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let x = squic::crypto::ed25519_private_to_x25519(&sk);
     let xpub = x25519_dalek::PublicKey::from(&x);
     println!("CLIENTX={}", hex::encode(xpub.to_bytes()));
+    println!("CLIENTVER={}", args.envelope_version);
     if args.advertise {
         println!("CLIENTED={}", hex::encode(ed_pub));
     } else {
@@ -127,6 +131,7 @@ async fn run_client(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         Config {
             client_key: Some(seed),
             advertise_identity: args.advertise,
+            envelope_version: args.envelope_version,
             ..Default::default()
         },
     )
