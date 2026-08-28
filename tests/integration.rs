@@ -720,3 +720,233 @@ async fn test_peer_key_none_for_unknown_dcid() {
     let seen = server.await.unwrap();
     assert!(seen.is_some(), "an ephemeral client still has a verified transport key");
 }
+
+/// Build one Initial envelope by hand, the way a client would.
+/// Returns the datagram ready to put on the wire.
+fn forge_initial(
+    shared: &[u8; 32],
+    client_x25519_pub: &[u8; 32],
+    mac2: [u8; 16],
+) -> Vec<u8> {
+    let datagram = {
+        let mut d = vec![0u8; 1200];
+        d[0] = 0xC0; // long header, fixed bit, Initial
+        d[5] = 8; // DCID length
+        d
+    };
+    let ed = [0u8; 32]; // no identity asserted
+    let ts = squic::mac::now_timestamp();
+    let nonce = squic::mac::generate_nonce();
+    let mac1 = squic::mac::compute_mac1(shared, &datagram, &ed, ts, &nonce);
+
+    let mut buf = datagram;
+    buf.extend_from_slice(client_x25519_pub);
+    buf.extend_from_slice(&ed);
+    buf.extend_from_slice(&ts.to_be_bytes());
+    buf.extend_from_slice(&nonce);
+    buf.extend_from_slice(&mac1);
+    buf.extend_from_slice(&mac2);
+    buf
+}
+
+/// A small-order client key makes the exchange non-contributory: the shared
+/// secret is all zeros whatever the server's private key is, so a caller who
+/// has never seen the server's public key can predict it and forge a MAC1 that
+/// verifies. SIP-6 step 5 is the only thing stopping this for a deployment with
+/// no whitelist.
+#[tokio::test]
+async fn test_small_order_client_key_is_refused() {
+    let (listener, _sk, _pk) = start_server(Config::default()).await;
+    let server_addr = listener.local_addr().unwrap();
+
+    // The attacker knows nothing about the server, and assumes the shared
+    // secret will be zeros — which it will be, if the check is missing.
+    let assumed_shared = [0u8; 32];
+    let small_order_key = [0u8; 32];
+    let buf = forge_initial(&assumed_shared, &small_order_key, [0u8; 16]);
+
+    let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    sock.send_to(&buf, server_addr).await.unwrap();
+
+    let accepted = tokio::time::timeout(Duration::from_millis(500), listener.accept()).await;
+    assert!(
+        accepted.is_err(),
+        "a stranger forged MAC1 with a small-order key and was admitted"
+    );
+}
+
+/// The whitelist is a filter, not proof of possession: the X25519 key is
+/// plaintext on the wire, so anyone who has seen an authorised client connect
+/// can copy the key. MAC1 still has to verify afterwards.
+#[tokio::test]
+async fn test_whitelist_does_not_substitute_for_mac1() {
+    let (_victim_sk, victim_ed) = squic::generate_keypair();
+    let victim_x = squic::crypto::ed25519_public_to_x25519(&victim_ed).unwrap();
+    let victim_key = victim_x.to_bytes();
+
+    let (listener, _sk, _pk) = start_server(Config {
+        allowed_keys: Some(vec![victim_key]),
+        ..Default::default()
+    })
+    .await;
+    let server_addr = listener.local_addr().unwrap();
+
+    // The attacker presents the victim's whitelisted key, and cannot compute
+    // the shared secret it belongs to.
+    let mut wrong_shared = [0u8; 32];
+    wrong_shared[0] = 0x5A;
+    let buf = forge_initial(&wrong_shared, &victim_key, [0u8; 16]);
+
+    let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    sock.send_to(&buf, server_addr).await.unwrap();
+
+    let accepted = tokio::time::timeout(Duration::from_millis(500), listener.accept()).await;
+    assert!(
+        accepted.is_err(),
+        "a whitelisted key admitted a caller that could not pass MAC1"
+    );
+}
+
+/// Under load, an Initial carrying the all-zero MAC2 sentinel must draw a
+/// cookie reply rather than being admitted — even though its MAC1 is perfectly
+/// good. This is the challenge half of SIP-7; the existing cookie test covers
+/// the answer half.
+#[tokio::test]
+async fn test_zero_mac2_under_load_draws_a_challenge() {
+    let (listener, signing_key, _pk) = start_server(Config::default()).await;
+    let server_addr = listener.local_addr().unwrap();
+    listener.set_under_load(true);
+
+    // A genuine caller: real key, real shared secret, real MAC1, no cookie.
+    let (client_sk, _client_ed) = squic::generate_keypair();
+    let client_x_priv = squic::crypto::ed25519_private_to_x25519(&client_sk);
+    let client_x_pub = x25519_dalek::PublicKey::from(&client_x_priv).to_bytes();
+    let server_x_pub =
+        squic::crypto::ed25519_public_to_x25519(&signing_key.verifying_key().to_bytes()).unwrap();
+    let shared = squic::crypto::x25519(&client_x_priv, &server_x_pub).unwrap();
+
+    let buf = forge_initial(&shared, &client_x_pub, [0u8; 16]);
+
+    let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    sock.send_to(&buf, server_addr).await.unwrap();
+
+    let mut reply = [0u8; 128];
+    let got = tokio::time::timeout(Duration::from_secs(2), sock.recv_from(&mut reply))
+        .await
+        .expect("no cookie reply arrived");
+    let (n, _from) = got.unwrap();
+
+    assert_eq!(
+        reply[0],
+        squic::mac::COOKIE_REPLY_TYPE,
+        "expected a cookie reply, got first byte {:#04x}",
+        reply[0]
+    );
+    // 1 type byte + 24 nonce + 16 cookie + 16 tag.
+    assert_eq!(n, 57, "cookie reply is not the width SIP-7 specifies");
+
+    // And it opens under the key any client can derive from the server's
+    // public key — SIP-7's cookie_key.
+    let cookie_key = squic::mac::cookie_key(&server_x_pub.to_bytes());
+    let cookie = squic::mac::decrypt_cookie(&cookie_key, &reply[1..n])
+        .expect("cookie reply did not open under the derived key");
+    assert_eq!(cookie.len(), 16);
+
+    let stats = listener.load_stats();
+    assert!(stats.under_load);
+    assert!(stats.cookie_replies_sent >= 1);
+}
+
+/// The server keeps the previous cookie secret for one rotation period. Without
+/// that grace, a client challenged just before a rotation answers with a cookie
+/// the server no longer recognises, is challenged again, and in a pathological
+/// case never converges.
+#[tokio::test]
+async fn test_cookie_secret_rotation_keeps_one_generation_of_grace() {
+    let (listener, signing_key, _pk) = start_server(Config::default()).await;
+    let server_addr = listener.local_addr().unwrap();
+    listener.set_under_load(true);
+
+    let (client_sk, _ed) = squic::generate_keypair();
+    let client_x_priv = squic::crypto::ed25519_private_to_x25519(&client_sk);
+    let client_x_pub = x25519_dalek::PublicKey::from(&client_x_priv).to_bytes();
+    let server_x_pub =
+        squic::crypto::ed25519_public_to_x25519(&signing_key.verifying_key().to_bytes()).unwrap();
+    let shared = squic::crypto::x25519(&client_x_priv, &server_x_pub).unwrap();
+    let cookie_key = squic::mac::cookie_key(&server_x_pub.to_bytes());
+
+    let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+    // Draw a challenge and keep the cookie.
+    sock.send_to(&forge_initial(&shared, &client_x_pub, [0u8; 16]), server_addr)
+        .await
+        .unwrap();
+    let mut reply = [0u8; 128];
+    let (n, _) = tokio::time::timeout(Duration::from_secs(2), sock.recv_from(&mut reply))
+        .await
+        .expect("no challenge")
+        .unwrap();
+    let cookie: [u8; 16] = squic::mac::decrypt_cookie(&cookie_key, &reply[1..n])
+        .expect("open the challenge")
+        .try_into()
+        .unwrap();
+
+    // Answering with a cookie minted under the current secret is admitted.
+    let before = listener.load_stats().mac2_verified;
+    send_with_cookie(&sock, server_addr, &shared, &client_x_pub, &cookie).await;
+    assert_eq!(
+        wait_for_mac2(&listener, before + 1).await,
+        before + 1,
+        "a fresh cookie was not accepted"
+    );
+
+    // One rotation later it is the *previous* secret, and still accepted.
+    listener.rotate_cookie_secret();
+    let before = listener.load_stats().mac2_verified;
+    send_with_cookie(&sock, server_addr, &shared, &client_x_pub, &cookie).await;
+    assert_eq!(
+        wait_for_mac2(&listener, before + 1).await,
+        before + 1,
+        "the grace period did not accept a cookie from the previous secret"
+    );
+
+    // Two rotations later it is older than the grace period, and is refused.
+    listener.rotate_cookie_secret();
+    listener.rotate_cookie_secret();
+    let before = listener.load_stats().mac2_verified;
+    send_with_cookie(&sock, server_addr, &shared, &client_x_pub, &cookie).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        listener.load_stats().mac2_verified,
+        before,
+        "a cookie two rotations old was still accepted"
+    );
+}
+
+async fn send_with_cookie(
+    sock: &tokio::net::UdpSocket,
+    to: SocketAddr,
+    shared: &[u8; 32],
+    client_pub: &[u8; 32],
+    cookie: &[u8; 16],
+) {
+    // Build the envelope, then compute MAC2 over it up to but not including
+    // MAC1 — the boundary SIP-7 specifies.
+    let mut buf = forge_initial(shared, client_pub, [0u8; 16]);
+    let len = buf.len();
+    let mac1: [u8; 16] = buf[len - 32..len - 16].try_into().unwrap();
+    let mac2 = squic::mac::compute_mac2(cookie, &buf[..len - 32], &mac1);
+    buf[len - 16..].copy_from_slice(&mac2);
+    sock.send_to(&buf, to).await.unwrap();
+}
+
+async fn wait_for_mac2(listener: &squic::ServerListener, want: u64) -> u64 {
+    for _ in 0..40 {
+        let n = listener.load_stats().mac2_verified;
+        if n >= want {
+            return n;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    listener.load_stats().mac2_verified
+}

@@ -254,6 +254,13 @@ impl ServerListener {
         self.socket.set_under_load(value);
     }
 
+    /// Rotate the cookie secret now. Exposed for tests, which would otherwise
+    /// have to wait out the 120-second rotation timer.
+    #[doc(hidden)]
+    pub fn rotate_cookie_secret(&self) {
+        self.socket.rotate_cookie_secret();
+    }
+
     /// Close the listener.
     pub fn close(&self, code: quinn::VarInt, reason: &[u8]) {
         self.endpoint.close(code, reason);

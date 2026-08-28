@@ -378,6 +378,17 @@ impl ServerSocket {
     pub fn set_under_load(&self, value: bool) {
         self.under_load.store(value, Ordering::Relaxed);
     }
+
+    /// Rotate the cookie secret now, so a test does not have to wait out the
+    /// 120-second timer to reach the grace branch.
+    #[doc(hidden)]
+    pub fn rotate_cookie_secret(&self) {
+        let mut fresh = [0u8; 32];
+        getrandom::fill(&mut fresh).expect("getrandom failed");
+        let current = *self.cookie_secret.read().unwrap();
+        *self.prev_cookie_secret.write().unwrap() = current;
+        *self.cookie_secret.write().unwrap() = fresh;
+    }
 }
 
 impl std::fmt::Debug for ServerSocket {

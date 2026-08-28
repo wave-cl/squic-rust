@@ -267,6 +267,76 @@ mod tests {
         assert!(!timestamp_in_window(now + 121, now));
     }
 
+    /// MAC2 covers the envelope up to but NOT including MAC1, with MAC1 fed in
+    /// separately. Hashing the buffer whole folds MAC1 in twice and never
+    /// verifies — and because a failing MAC2 is indistinguishable from a client
+    /// that has no cookie, the symptom is not an error but a handshake that
+    /// takes an extra round trip forever. Both sides have to draw the boundary
+    /// in the same place, so it is pinned here.
+    #[test]
+    fn mac2_covers_the_envelope_up_to_mac1() {
+        let cookie = [0x7Au8; 16];
+        let shared = [0xABu8; 32];
+        let datagram = b"a QUIC Initial, more or less";
+        let ed = [0u8; ED25519_SIZE];
+        let ts = now_timestamp();
+        let nonce = generate_nonce();
+        let mac1 = compute_mac1(&shared, datagram, &ed, ts, &nonce);
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(datagram);
+        buf.extend_from_slice(&[0x11u8; CLIENT_KEY_SIZE]);
+        buf.extend_from_slice(&ed);
+        buf.extend_from_slice(&ts.to_be_bytes());
+        buf.extend_from_slice(&nonce);
+        let before_mac1 = buf.len();
+        buf.extend_from_slice(&mac1);
+
+        let right = compute_mac2(&cookie, &buf[..before_mac1], &mac1);
+        assert!(verify_mac2(&cookie, &buf[..before_mac1], &mac1, &right));
+
+        // The mistake: covering MAC1 as well, then passing it again.
+        let wrong = compute_mac2(&cookie, &buf, &mac1);
+        assert!(
+            !verify_mac2(&cookie, &buf[..before_mac1], &mac1, &wrong),
+            "MAC2 over the whole buffer must not verify against the specified range"
+        );
+    }
+
+    /// An IPv4 address and its IPv4-mapped IPv6 form are the same client, and
+    /// must mint the same cookie — otherwise a client reaching a dual-stack
+    /// socket is challenged with one cookie and verified against another.
+    #[test]
+    fn cookie_is_the_same_for_v4_and_its_mapped_form() {
+        let secret = [0x33u8; 32];
+        let v4: IpAddr = "192.0.2.7".parse().unwrap();
+        let mapped: IpAddr = "::ffff:192.0.2.7".parse().unwrap();
+        assert_eq!(cookie_value(&secret, v4), cookie_value(&secret, mapped));
+
+        // A different address is a different cookie.
+        let other: IpAddr = "192.0.2.8".parse().unwrap();
+        assert_ne!(cookie_value(&secret, v4), cookie_value(&secret, other));
+    }
+
+    /// The client derives the reply key from the server's public key alone —
+    /// no Diffie-Hellman, which is the whole point of the cookie. If the two
+    /// ends ever disagreed on this derivation the client could not open a
+    /// challenge and would be stuck at one round trip per Initial, forever.
+    #[test]
+    fn cookie_reply_opens_under_the_derived_key() {
+        let server_pub = [0x5Cu8; 32];
+        let key = cookie_key(&server_pub);
+        let cookie = [0x42u8; 16];
+
+        let sealed = encrypt_cookie(&key, &cookie).expect("seal");
+        assert_eq!(sealed.len(), COOKIE_NONCE_SIZE + 16 + 16);
+        assert_eq!(decrypt_cookie(&key, &sealed).as_deref(), Some(&cookie[..]));
+
+        // Derived from a different server key, it does not open.
+        let wrong = cookie_key(&[0x5Du8; 32]);
+        assert!(decrypt_cookie(&wrong, &sealed).is_none());
+    }
+
     #[test]
     fn test_is_quic_initial() {
         assert!(is_quic_initial(&[0xC0, 0, 0, 0, 0]));
