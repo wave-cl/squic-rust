@@ -179,21 +179,21 @@ pub struct Config {
     pub load_threshold: Option<u64>,
     /// SIP-29: the envelope version this client emits.
     ///
-    /// Default: `ENVELOPE_V2`, unchanged in v0.19.0 even though that release
-    /// introduces `ENVELOPE_V3`. That is the discipline SIP-29 requires — a
-    /// release that introduces a version ships clients still sending the
-    /// previous one, so that upgrading a client before a server cannot break
-    /// anything, and a later release moves the default once servers have had
-    /// time to deploy. This is the *earlier* half for version 3; v0.18.0 was
-    /// the later half for version 2.
+    /// Default: `ENVELOPE_V3` as of v0.20.0. It was `ENVELOPE_V2` in v0.19.0,
+    /// which introduced version 3 — the discipline SIP-29 requires is that a
+    /// release introducing a version ships clients still sending the previous
+    /// one, so upgrading a client before a server cannot break anything, and a
+    /// later release moves the default once servers have deployed. This is
+    /// that later release.
     ///
-    /// Set it to `ENVELOPE_V3` to opt in early, against servers known to be
-    /// v0.19.0 or newer. Version 3 is what carries MAC0 (SIP-37), so a
-    /// deployment that wants a server silent under load needs its clients on
-    /// it before the server can retire versions 1 and 2.
+    /// Version 3 is what carries MAC0 (SIP-37), so this is also the release
+    /// that lets a deployment retire versions 1 and 2 and get a server that
+    /// stays silent under load.
     ///
-    /// Set it back to `ENVELOPE_V1` if you still talk to a server older than
-    /// squic v0.17.0, which will drop a version 2 Initial in silence.
+    /// Set it back to `ENVELOPE_V2` if you still talk to a server older than
+    /// squic v0.19.0, or to `ENVELOPE_V1` for one older than v0.17.0. Either
+    /// will drop a version 3 Initial in silence, so the symptom of aiming too
+    /// high is a handshake timeout with no diagnostic.
     pub envelope_version: u8,
     /// SIP-29: the envelope versions this server parses.
     ///
@@ -231,7 +231,7 @@ impl Default for Config {
             client_key: None,
             advertise_identity: false,
             load_threshold: None,
-            envelope_version: crate::mac::ENVELOPE_V2,
+            envelope_version: crate::mac::ENVELOPE_V3,
             accepted_envelope_versions: vec![
                 crate::mac::ENVELOPE_V1,
                 crate::mac::ENVELOPE_V2,

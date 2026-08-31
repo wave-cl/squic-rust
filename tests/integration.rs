@@ -1142,13 +1142,17 @@ async fn wait_for_mac2(listener: &squic::ServerListener, want: u64) -> u64 {
 /// a server still accepts version 1, because retiring it is a separate decision
 /// a deployment makes for itself.
 #[test]
-fn the_client_default_is_version_2_and_servers_still_accept_version_1() {
+fn the_client_default_is_version_3_and_servers_still_accept_the_older_ones() {
     let config = Config::default();
-    assert_eq!(config.envelope_version, squic::mac::ENVELOPE_V2);
-    assert!(config
-        .accepted_envelope_versions
-        .contains(&squic::mac::ENVELOPE_V1));
-    assert!(config
-        .accepted_envelope_versions
-        .contains(&squic::mac::ENVELOPE_V2));
+    assert_eq!(config.envelope_version, squic::mac::ENVELOPE_V3);
+    // A server upgraded to this release still serves the clients that have not
+    // moved. Retiring the older versions is a deployment's own decision, and
+    // the thing that finally makes the cookie stage silent (SIP-37).
+    for v in [
+        squic::mac::ENVELOPE_V1,
+        squic::mac::ENVELOPE_V2,
+        squic::mac::ENVELOPE_V3,
+    ] {
+        assert!(config.accepted_envelope_versions.contains(&v));
+    }
 }
