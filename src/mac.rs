@@ -36,11 +36,30 @@ pub const ENVELOPE_V1: u8 = 1;
 /// Envelope version 2 (SIP-29): version 1 plus a one-byte marker, last.
 pub const ENVELOPE_V2: u8 = 2;
 
+/// Envelope version 3: version 2 plus MAC0, a cheap outer MAC keyed on the
+/// server's public key and verified before any curve operation.
+///
+/// MAC1 is a Diffie-Hellman, so a server cannot tell a caller who knows its
+/// public key from a stranger without paying for one — which is why the cookie
+/// defence has to challenge before it knows who it is talking to, and why a
+/// server under load answers everybody. WireGuard does not have this problem:
+/// its MAC1 is keyed on a *hash* of the responder's static public key and costs
+/// a hash to check, so it only ever cookies callers that have already proved
+/// they know the key. MAC0 is that construction, added alongside sQUIC's MAC1
+/// rather than replacing it.
+pub const ENVELOPE_V3: u8 = 3;
+
+/// Size of the MAC0 tag in bytes.
+pub const MAC0_SIZE: usize = 16;
+
 /// Size of the version marker.
 pub const VERSION_SIZE: usize = 1;
 
 /// Trailer width for envelope version 2.
 pub const MAC_OVERHEAD_V2: usize = MAC_OVERHEAD + VERSION_SIZE;
+
+/// Trailer width for envelope version 3: version 2 plus the MAC0 field.
+pub const MAC_OVERHEAD_V3: usize = MAC_OVERHEAD_V2 + MAC0_SIZE;
 
 // Static assertions: the version 1 trailer is 108 bytes (32+32+4+8+16+16) and
 // version 2 is one more. If either changes, update ClientSocket::try_send(),
@@ -48,6 +67,7 @@ pub const MAC_OVERHEAD_V2: usize = MAC_OVERHEAD + VERSION_SIZE;
 // on Linux.
 const _: () = assert!(MAC_OVERHEAD == 108, "MAC_OVERHEAD changed — update Initial send path in conn.rs");
 const _: () = assert!(MAC_OVERHEAD_V2 == 109, "MAC_OVERHEAD_V2 changed — update Initial send path in conn.rs");
+const _: () = assert!(MAC_OVERHEAD_V3 == 125, "MAC_OVERHEAD_V3 changed — update Initial send path in conn.rs");
 
 /// The trailer width for an envelope version, or `None` if unknown.
 ///
@@ -57,8 +77,59 @@ pub fn trailer_len(version: u8) -> Option<usize> {
     match version {
         ENVELOPE_V1 => Some(MAC_OVERHEAD),
         ENVELOPE_V2 => Some(MAC_OVERHEAD_V2),
+        ENVELOPE_V3 => Some(MAC_OVERHEAD_V3),
         _ => None,
     }
+}
+
+/// Whether this envelope version carries a MAC0 field.
+pub fn has_mac0(version: u8) -> bool {
+    version >= ENVELOPE_V3
+}
+
+/// Domain separator for the MAC0 key.
+const MAC0_KEY_LABEL: &[u8] = b"squic-mac0-v1";
+
+/// Derive the MAC0 key from the server's X25519 public key.
+///
+/// Keyed on a *public* value, deliberately. Every legitimate caller already
+/// holds the server's public key — that is the premise of a silent server — so
+/// both ends can compute this with one hash and no key agreement. It is
+/// therefore not authentication: anyone holding the key can forge a MAC0, and
+/// MAC1 remains the proof of possession. What it buys is that a caller who does
+/// *not* hold the key can be turned away for the price of one HMAC, before the
+/// cookie decision and before the Diffie-Hellman.
+pub fn mac0_key(server_x25519_pub: &[u8; 32]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(MAC0_KEY_LABEL);
+    hasher.update(server_x25519_pub);
+    hasher.finalize().into()
+}
+
+/// Compute MAC0 over the envelope up to but not including MAC0 itself.
+///
+/// `covered` is `datagram || x25519 || ed25519 || ts || nonce` — one contiguous
+/// slice, which is why this takes bytes rather than fields. The version is
+/// prefixed for the reason SIP-29 gives for MAC1: it authenticates the marker a
+/// receiver has to read before it can verify anything, and it makes tags
+/// computed under different versions unrelated.
+///
+/// Unlike MAC1 this covers the client's X25519 key explicitly. MAC1 does not
+/// need to — that key is what its shared secret is derived from — but MAC0's
+/// key does not depend on it, so leaving it out would let it be swapped.
+pub fn compute_mac0(version: u8, key: &[u8; 32], covered: &[u8]) -> [u8; MAC0_SIZE] {
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(key).expect("HMAC accepts any key size");
+    mac.update(&[version]);
+    mac.update(covered);
+    let result = mac.finalize().into_bytes();
+    let mut tag = [0u8; MAC0_SIZE];
+    tag.copy_from_slice(&result[..MAC0_SIZE]);
+    tag
+}
+
+/// Verify MAC0 with constant-time comparison.
+pub fn verify_mac0(version: u8, key: &[u8; 32], covered: &[u8], mac0: &[u8]) -> bool {
+    constant_time_eq(&compute_mac0(version, key, covered), mac0)
 }
 
 /// First byte of a cookie reply packet.
@@ -348,11 +419,66 @@ mod tests {
         assert_eq!(trailer_len(ENVELOPE_V1), Some(MAC_OVERHEAD));
         assert_eq!(trailer_len(ENVELOPE_V2), Some(MAC_OVERHEAD_V2));
         assert_eq!(trailer_len(ENVELOPE_V2), Some(MAC_OVERHEAD + 1));
+        assert_eq!(trailer_len(ENVELOPE_V3), Some(MAC_OVERHEAD_V3));
+        assert_eq!(trailer_len(ENVELOPE_V3), Some(MAC_OVERHEAD_V2 + MAC0_SIZE));
         // Version 0 is reserved and never emitted, so a zero byte is known not
         // to be a marker.
         assert_eq!(trailer_len(0), None);
-        assert_eq!(trailer_len(3), None);
+        assert_eq!(trailer_len(4), None);
         assert_eq!(trailer_len(255), None);
+    }
+
+    /// Only v3 carries MAC0, and that is what decides whether a caller can be
+    /// turned away before the cookie stage.
+    #[test]
+    fn only_version_3_carries_mac0() {
+        assert!(!has_mac0(ENVELOPE_V1));
+        assert!(!has_mac0(ENVELOPE_V2));
+        assert!(has_mac0(ENVELOPE_V3));
+    }
+
+    /// MAC0 is keyed on the server's public key, so a caller holding that key
+    /// can compute it and a caller without it cannot. That is the whole
+    /// property: it separates "knows the key" from "does not" for the price of
+    /// one HMAC, with no curve operation and no cookie exchange.
+    #[test]
+    fn mac0_separates_a_caller_who_knows_the_key_from_one_who_does_not() {
+        let server_pub = [0x5Cu8; 32];
+        let key = mac0_key(&server_pub);
+        let covered = b"a QUIC Initial and its envelope, up to MAC0";
+
+        let tag = compute_mac0(ENVELOPE_V3, &key, covered);
+        assert!(verify_mac0(ENVELOPE_V3, &key, covered, &tag));
+
+        // A stranger guesses at the server's key and cannot produce the tag.
+        let stranger = mac0_key(&[0x5Du8; 32]);
+        assert!(!verify_mac0(ENVELOPE_V3, &stranger, covered, &tag));
+
+        // Tampering with any covered byte breaks it.
+        let mut tampered = covered.to_vec();
+        tampered[0] ^= 0xFF;
+        assert!(!verify_mac0(ENVELOPE_V3, &key, &tampered, &tag));
+    }
+
+    /// The version is prefixed to MAC0's input for the reason SIP-29 gives for
+    /// MAC1: a receiver reads the marker before it can verify anything, so the
+    /// marker has to be inside what it verifies.
+    #[test]
+    fn mac0_is_bound_to_the_envelope_version() {
+        let key = mac0_key(&[7u8; 32]);
+        let covered = b"same bytes, different version";
+        let v3 = compute_mac0(ENVELOPE_V3, &key, covered);
+        let v4 = compute_mac0(4, &key, covered);
+        assert_ne!(v3, v4);
+        assert!(!verify_mac0(4, &key, covered, &v3));
+    }
+
+    /// MAC0 and the cookie-reply key are both derived from the server's public
+    /// key and must not collide — separate labels, separate keys.
+    #[test]
+    fn mac0_and_cookie_keys_are_separated_by_their_labels() {
+        let server_pub = [0x11u8; 32];
+        assert_ne!(mac0_key(&server_pub), cookie_key(&server_pub));
     }
 
     #[test]

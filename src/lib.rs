@@ -191,10 +191,16 @@ pub struct Config {
     pub envelope_version: u8,
     /// SIP-29: the envelope versions this server parses.
     ///
-    /// Default: both, so a server can be upgraded without waiting for its
-    /// clients. Drop `ENVELOPE_V1` to retire it — which a deployment MUST be
-    /// able to do, or the oldest envelope ever defined becomes a permanent
-    /// floor.
+    /// Default: all of them, so a server can be upgraded without waiting for
+    /// its clients. Drop older versions to retire them — which a deployment
+    /// MUST be able to do, or the oldest envelope ever defined becomes a
+    /// permanent floor.
+    ///
+    /// Retiring v1 and v2 is what finishes the job v3 starts. Only v3 carries
+    /// MAC0, so only a v3 caller can be turned away before the cookie stage; a
+    /// server still accepting v1 or v2 will keep answering callers on those
+    /// versions with a cookie while it is under load, whatever they know. Set
+    /// this to `vec![ENVELOPE_V3]` once the clients have moved.
     pub accepted_envelope_versions: Vec<u8>,
 }
 
@@ -220,7 +226,11 @@ impl Default for Config {
             advertise_identity: false,
             load_threshold: None,
             envelope_version: crate::mac::ENVELOPE_V2,
-            accepted_envelope_versions: vec![crate::mac::ENVELOPE_V1, crate::mac::ENVELOPE_V2],
+            accepted_envelope_versions: vec![
+                crate::mac::ENVELOPE_V1,
+                crate::mac::ENVELOPE_V2,
+                crate::mac::ENVELOPE_V3,
+            ],
         }
     }
 }
@@ -504,11 +514,13 @@ pub async fn dial(
     let socket = Arc::new(tokio::net::UdpSocket::from_std(std_socket).map_err(Error::Io)?);
 
     let cookie_key = crate::mac::cookie_key(server_x25519_pub.as_bytes());
+    let mac0_key = crate::mac::mac0_key(server_x25519_pub.as_bytes());
     let client_socket = ClientSocket::new(
         socket,
         shared,
         client_x25519_pub.to_bytes(),
         advertise_ed25519,
+        mac0_key,
         cookie_key,
         config.envelope_version,
     );
