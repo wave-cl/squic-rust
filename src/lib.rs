@@ -517,11 +517,14 @@ pub async fn dial(
     let mac0_key = crate::mac::mac0_key(server_x25519_pub.as_bytes());
     let client_socket = ClientSocket::new(
         socket,
-        shared,
-        client_x25519_pub.to_bytes(),
-        advertise_ed25519,
-        mac0_key,
-        cookie_key,
+        conn::ClientKeys {
+            shared_secret: shared,
+            client_pub_key: client_x25519_pub.to_bytes(),
+            advertise_ed25519,
+            mac0_key,
+            cookie_key,
+        },
+        addr,
         config.envelope_version,
     );
 

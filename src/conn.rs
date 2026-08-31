@@ -11,7 +11,7 @@ use crate::whitelist::Whitelist;
 use quinn::udp::{RecvMeta, Transmit, UdpSocketState};
 use quinn::AsyncUdpSocket;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
@@ -200,6 +200,23 @@ fn initial_dcid(pkt: &[u8]) -> Option<&[u8]> {
 /// the handshake looks like this, and nothing before it does.
 fn is_short_header(data: &[u8]) -> bool {
     !data.is_empty() && data[0] & 0xC0 == 0x40
+}
+
+/// Whether two socket addresses name the same peer.
+///
+/// An IPv4 address and its IPv4-mapped IPv6 form are the same host, and a
+/// dual-stack socket may report either — so comparing `SocketAddr` directly
+/// would reject the server's own cookie reply and stall the handshake rather
+/// than fail loudly. `cookie_value` normalises the same way for the same
+/// reason.
+fn same_peer(a: SocketAddr, b: SocketAddr) -> bool {
+    fn unmap(ip: IpAddr) -> IpAddr {
+        match ip {
+            IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(IpAddr::V6(v6), IpAddr::V4),
+            v4 => v4,
+        }
+    }
+    a.port() == b.port() && unmap(a.ip()) == unmap(b.ip())
 }
 
 /// A QUIC long header: the header-form bit is set. Initial, 0-RTT, Handshake
@@ -738,6 +755,9 @@ pub struct ClientSocket {
     /// SIP-3: the Ed25519 identity advertised in the Initial envelope, or all
     /// zeros to assert none. It forward-derives to `client_pub_key`.
     advertise_ed25519: [u8; 32],
+    /// The address this client dialled. A cookie reply from anywhere else is
+    /// not ours to act on.
+    server_addr: SocketAddr,
     /// SIP-29: the envelope version this client emits. One version per
     /// connection attempt, never a fallback — the server is silent, so a
     /// timeout would say nothing about which version it wanted.
@@ -750,18 +770,43 @@ pub struct ClientSocket {
     // The most recent Initial datagram and where it went, so a cookie
     // challenge can be answered immediately rather than at the next PTO.
     last_initial: RwLock<Option<(Vec<u8>, SocketAddr)>>,
+    /// Whether the current Initial has already had a challenge answered for
+    /// it. One answer per Initial sent, which is what bounds the work an
+    /// injected cookie reply can buy.
+    answered: AtomicBool,
+}
+
+/// The key material a client derives before its socket exists.
+///
+/// Grouped because it is derived together, from the same two keys, and passing
+/// five `[u8; 32]`s positionally is how they get transposed.
+pub struct ClientKeys {
+    /// X25519(client_priv, server_pub) — keys MAC1.
+    pub shared_secret: [u8; 32],
+    /// The client's X25519 public key, as it appears in the envelope.
+    pub client_pub_key: [u8; 32],
+    /// SIP-3: the Ed25519 identity to advertise, or all zeros for none.
+    pub advertise_ed25519: [u8; 32],
+    /// Keys MAC0 (envelope v3); derived from the server's public key.
+    pub mac0_key: [u8; 32],
+    /// Decrypts cookie replies; derived from the server's public key.
+    pub cookie_key: [u8; 32],
 }
 
 impl ClientSocket {
     pub fn new(
         socket: Arc<tokio::net::UdpSocket>,
-        shared_secret: [u8; 32],
-        client_pub_key: [u8; 32],
-        advertise_ed25519: [u8; 32],
-        mac0_key: [u8; 32],
-        cookie_key: [u8; 32],
+        keys: ClientKeys,
+        server_addr: SocketAddr,
         envelope_version: u8,
     ) -> Self {
+        let ClientKeys {
+            shared_secret,
+            client_pub_key,
+            advertise_ed25519,
+            mac0_key,
+            cookie_key,
+        } = keys;
         let inner = UdpSocketState::new((&*socket).into()).expect("UdpSocketState::new");
         Self {
             io: socket,
@@ -769,12 +814,14 @@ impl ClientSocket {
             shared_secret,
             client_pub_key,
             advertise_ed25519,
+            server_addr,
             envelope_version,
             mac0_key,
             cookie_key,
             handshake_done: AtomicBool::new(false),
             cookie: RwLock::new(None),
             last_initial: RwLock::new(None),
+            answered: AtomicBool::new(false),
         }
     }
 }
@@ -797,6 +844,8 @@ impl ClientSocket {
         let cookie = *self.cookie.read().unwrap();
         let buf = self.build_initial(datagram, cookie.as_ref());
         *self.last_initial.write().unwrap() = Some((datagram.to_vec(), destination));
+        // A fresh Initial earns one answered challenge.
+        self.answered.store(false, Ordering::Relaxed);
 
         // PERF NOTE: We bypass quinn-udp's UdpSocketState::send() here and
         // send the Initial packet as a raw datagram via try_send_to().
@@ -832,14 +881,25 @@ impl ClientSocket {
         let Some(plain) = decrypt_cookie(&self.cookie_key, payload) else {
             return false;
         };
-        match <[u8; 16]>::try_from(plain.as_slice()) {
-            Ok(c) => {
-                *self.cookie.write().unwrap() = Some(c);
-                self.answer_challenge(&c);
-                true
-            }
-            Err(_) => false,
+        let Ok(c) = <[u8; 16]>::try_from(plain.as_slice()) else {
+            return false;
+        };
+
+        // A reply carrying a cookie we already hold tells us nothing new, so
+        // it earns no retransmission. Without this, one captured cookie reply
+        // replayed at us is an unbounded supply of Initials aimed at the
+        // server — the reply is 57 bytes and the Initial it provokes is
+        // 1308.
+        let is_new = {
+            let mut slot = self.cookie.write().unwrap();
+            let new = *slot != Some(c);
+            *slot = Some(c);
+            new
+        };
+        if is_new {
+            self.answer_challenge(&c);
         }
+        true
     }
 
     /// Re-send the last Initial straight away, now carrying MAC2.
@@ -855,6 +915,14 @@ impl ClientSocket {
     /// cleared in between) quinn discards the duplicate. Only the sQUIC envelope
     /// is rebuilt — fresh timestamp, nonce and MAC1 — never the QUIC packet.
     fn answer_challenge(&self, cookie: &[u8; 16]) {
+        // One answer per Initial sent. A challenge is a response to something
+        // we sent, so answering more than once for the same Initial is work an
+        // attacker chose for us rather than work the handshake needs. `swap`
+        // is the whole check: whoever gets `false` answers, everyone else
+        // returns.
+        if self.answered.swap(true, Ordering::Relaxed) {
+            return;
+        }
         let Some((datagram, destination)) = self.last_initial.read().unwrap().clone() else {
             return; // nothing sent yet; the next Initial will carry the cookie
         };
@@ -986,7 +1054,16 @@ impl AsyncUdpSocket for ClientSocket {
                 let mut valid = 0;
                 for i in 0..count {
                     let len = metas[i].len;
-                    if len > 0 && bufs[i][0] == COOKIE_REPLY_TYPE {
+                    // A cookie reply is only ours if it came from the server we
+                    // dialled. The reply is encrypted under a key derived from
+                    // the server's *public* key, so anyone at all can mint one
+                    // that opens — the source is the only thing that
+                    // distinguishes the server from a stranger who wants us to
+                    // shout at it.
+                    if len > 0
+                        && bufs[i][0] == COOKIE_REPLY_TYPE
+                        && same_peer(metas[i].addr, self.server_addr)
+                    {
                         self.store_cookie(&bufs[i][1..len]);
                         continue;
                     }
@@ -1053,6 +1130,7 @@ mod tests {
     use super::*;
     use crate::crypto::{ed25519_private_to_x25519, x25519};
     use crate::mac::{cookie_key, ENVELOPE_V2, ENVELOPE_V3};
+    use std::task::Waker;
 
     async fn socket() -> Arc<tokio::net::UdpSocket> {
         Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap())
@@ -1078,8 +1156,10 @@ mod tests {
         let client_pub = X25519Public::from(&client_priv);
         let shared = x25519(&client_priv, &server_pub).unwrap();
 
+        let server_sock = socket().await;
+        let server_addr = server_sock.local_addr().unwrap();
         let server = ServerSocket::new(
-            socket().await,
+            server_sock,
             server_priv,
             Arc::new(Whitelist::new(None)),
             1000,
@@ -1087,11 +1167,15 @@ mod tests {
         );
         let client = ClientSocket::new(
             socket().await,
-            shared,
-            client_pub.to_bytes(),
-            [0u8; 32], // advertise no Ed25519 identity (random X25519 test key)
-            crate::mac::mac0_key(server_pub.as_bytes()),
-            cookie_key(server_pub.as_bytes()),
+            ClientKeys {
+                shared_secret: shared,
+                client_pub_key: client_pub.to_bytes(),
+                // advertise no Ed25519 identity (random X25519 test key)
+                advertise_ed25519: [0u8; 32],
+                mac0_key: crate::mac::mac0_key(server_pub.as_bytes()),
+                cookie_key: cookie_key(server_pub.as_bytes()),
+            },
+            server_addr,
             client_version,
         );
         (server, client)
@@ -1453,6 +1537,169 @@ mod tests {
             server.load_stats().cookie_replies_sent, 1,
             "expected v1 to still leak a challenge — if this changed, update SIP-7 and the rollout note"
         );
+    }
+
+    /// Drive one pass of the client's receive path, so the cookie-reply
+    /// handling in `poll_recv` is what the tests below exercise rather than a
+    /// reimplementation of it.
+    fn pump(client: &ClientSocket) {
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut b = [0u8; 2048];
+        let mut bufs = [std::io::IoSliceMut::new(&mut b)];
+        let mut metas = [quinn::udp::RecvMeta::default()];
+        let _ = client.poll_recv(&mut cx, &mut bufs, &mut metas);
+    }
+
+    /// Anyone can mint a cookie reply the client will open — it is sealed under
+    /// a key derived from the server's *public* key, which is published. So the
+    /// source address is the only thing separating the server from a stranger
+    /// who would like the client to send a 1308-byte Initial for every 57 bytes
+    /// they spend.
+    #[tokio::test]
+    async fn a_cookie_reply_from_a_stranger_is_ignored() {
+        let (server, client) = pair().await;
+        let server_addr = server.io.local_addr().unwrap();
+        let client_addr = client.io.local_addr().unwrap();
+        let mut junk = vec![0u8; 4096];
+
+        // An Initial in flight, so a challenge would be answerable.
+        client.io.writable().await.unwrap();
+        client.send_initial(&initial(), server_addr).unwrap();
+        let _ = tokio::time::timeout(
+            Duration::from_millis(300),
+            server.io.recv_from(&mut junk),
+        )
+        .await;
+
+        let stranger = socket().await;
+        let sealed = encrypt_cookie(&client.cookie_key, &[0x9Au8; 16]).unwrap();
+        let mut reply = vec![COOKIE_REPLY_TYPE];
+        reply.extend_from_slice(&sealed);
+        stranger.send_to(&reply, client_addr).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        client.io.writable().await.unwrap();
+        pump(&client);
+
+        assert!(
+            client.cookie.read().unwrap().is_none(),
+            "a stranger set our cookie"
+        );
+        let echoed = tokio::time::timeout(
+            Duration::from_millis(300),
+            server.io.recv_from(&mut junk),
+        )
+        .await;
+        assert!(
+            echoed.is_err(),
+            "an injected cookie reply made the client shout at the server"
+        );
+    }
+
+    /// The amplifier this closes: one Initial earns one answered challenge,
+    /// however many replies arrive. Each reply here carries a *different*
+    /// cookie, so it is the per-Initial allowance being measured and not the
+    /// duplicate check.
+    #[tokio::test]
+    async fn one_initial_earns_one_answered_challenge() {
+        let (server, client) = pair().await;
+        let server_addr = server.io.local_addr().unwrap();
+        let client_addr = client.io.local_addr().unwrap();
+        let mut junk = vec![0u8; 4096];
+
+        client.io.writable().await.unwrap();
+        client.send_initial(&initial(), server_addr).unwrap();
+        let _ = tokio::time::timeout(
+            Duration::from_millis(300),
+            server.io.recv_from(&mut junk),
+        )
+        .await;
+
+        for i in 0..10u8 {
+            let sealed = encrypt_cookie(&client.cookie_key, &[i; 16]).unwrap();
+            let mut reply = vec![COOKIE_REPLY_TYPE];
+            reply.extend_from_slice(&sealed);
+            server.io.send_to(&reply, client_addr).await.unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        client.io.writable().await.unwrap();
+        for _ in 0..10 {
+            pump(&client);
+        }
+
+        let mut answers = 0;
+        while tokio::time::timeout(
+            Duration::from_millis(250),
+            server.io.recv_from(&mut junk),
+        )
+        .await
+        .is_ok()
+        {
+            answers += 1;
+        }
+        assert_eq!(
+            answers, 1,
+            "ten injected replies bought {answers} Initials; the allowance is one per Initial sent"
+        );
+    }
+
+    /// And a cookie we already hold earns nothing, even after a fresh Initial
+    /// has re-armed the allowance. A captured reply replayed at the client is
+    /// then worth nothing at all.
+    #[tokio::test]
+    async fn a_repeated_cookie_earns_no_further_answer() {
+        let (server, client) = pair().await;
+        let server_addr = server.io.local_addr().unwrap();
+        let client_addr = client.io.local_addr().unwrap();
+        let mut junk = vec![0u8; 4096];
+
+        let sealed = encrypt_cookie(&client.cookie_key, &[0x77u8; 16]).unwrap();
+        let mut reply = vec![COOKIE_REPLY_TYPE];
+        reply.extend_from_slice(&sealed);
+
+        // First Initial, first reply: answered.
+        client.io.writable().await.unwrap();
+        client.send_initial(&initial(), server_addr).unwrap();
+        let _ = tokio::time::timeout(Duration::from_millis(300), server.io.recv_from(&mut junk)).await;
+        server.io.send_to(&reply, client_addr).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        client.io.writable().await.unwrap();
+        pump(&client);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), server.io.recv_from(&mut junk))
+                .await
+                .is_ok(),
+            "the first challenge was not answered at all"
+        );
+
+        // A second Initial re-arms the allowance, so only the duplicate check
+        // stands between a replayed reply and another Initial.
+        client.io.writable().await.unwrap();
+        client.send_initial(&initial(), server_addr).unwrap();
+        let _ = tokio::time::timeout(Duration::from_millis(300), server.io.recv_from(&mut junk)).await;
+        server.io.send_to(&reply, client_addr).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        client.io.writable().await.unwrap();
+        pump(&client);
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), server.io.recv_from(&mut junk))
+                .await
+                .is_err(),
+            "a cookie we already held bought another Initial"
+        );
+    }
+
+    /// A dual-stack socket may report an IPv4 peer either way round, and the
+    /// server's own reply must not be turned away for it.
+    #[test]
+    fn same_peer_sees_through_the_ipv4_mapped_form() {
+        let v4: SocketAddr = "192.0.2.7:443".parse().unwrap();
+        let mapped: SocketAddr = "[::ffff:192.0.2.7]:443".parse().unwrap();
+        assert!(same_peer(v4, mapped));
+        assert!(same_peer(mapped, v4));
+        // A different port or host is a different peer.
+        assert!(!same_peer(v4, "192.0.2.7:444".parse().unwrap()));
+        assert!(!same_peer(v4, "192.0.2.8:443".parse().unwrap()));
     }
 
     /// A deployment must be able to retire a version, or the oldest envelope
