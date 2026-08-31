@@ -683,47 +683,44 @@ impl AsyncUdpSocket for ServerSocket {
             if let Ok(count) = self.io.try_io(Interest::READABLE, || {
                 self.inner.recv((&*self.io).into(), bufs, metas)
             }) {
-                // Validate each received packet in place.
-                // Strip MAC overhead from Initial packets by adjusting meta.len.
-                // Invalid packets get meta.len = 0 and are counted as dropped.
+                // Validate each packet in place, stripping the envelope from
+                // Initials, and compact the survivors to the front — quinn
+                // expects the entries it is handed to be contiguous.
+                //
+                // One pass, and one definition of "kept". This used to count
+                // survivors in a first pass and compact on `meta.len > 0` in a
+                // second, which are not the same predicate: a zero-length
+                // datagram is *accepted* by `validate_and_strip` (it is not an
+                // Initial, so it passes through) and so was counted, but the
+                // compaction skipped it. A batch holding one of those and one
+                // dropped packet returned a count of 1 with nothing written,
+                // handing quinn a stale `RecvMeta`. Harmless in practice —
+                // quinn discards it — but two predicates for one property is
+                // the kind of thing that stops being harmless when either side
+                // is edited.
                 let mut valid = 0;
-                for i in 0..count {
-                    let len = metas[i].len;
-                    let buf = &mut bufs[i][..len];
-                    let addr = Some(metas[i].addr);
-                    match self.validate_and_strip(buf, len, addr) {
-                        Some(new_len) => {
-                            metas[i].len = new_len;
-                            valid += 1;
-                        }
-                        None => {
-                            metas[i].len = 0; // mark as dropped
-                        }
+                for read in 0..count {
+                    let len = metas[read].len;
+                    let addr = Some(metas[read].addr);
+                    let Some(new_len) = self.validate_and_strip(&mut bufs[read][..len], len, addr)
+                    else {
+                        continue; // dropped
+                    };
+                    if new_len == 0 {
+                        continue; // an empty datagram; there is nothing to parse
                     }
-                }
-                // Remove dropped packets by compacting metas
-                // (Quinn expects contiguous valid entries)
-                if valid < count {
-                    let mut write = 0;
-                    for read in 0..count {
-                        if metas[read].len > 0 {
-                            if write != read {
-                                metas[write] = metas[read];
-                                // Copy packet data to compacted position
-                                let len = metas[write].len;
-                                let (left, right) = bufs.split_at_mut(read);
-                                left[write][..len].copy_from_slice(&right[0][..len]);
-                            }
-                            write += 1;
-                        }
+                    if valid != read {
+                        metas[valid] = metas[read];
+                        let (left, right) = bufs.split_at_mut(read);
+                        left[valid][..new_len].copy_from_slice(&right[0][..new_len]);
                     }
+                    metas[valid].len = new_len;
+                    valid += 1;
                 }
                 if valid == 0 {
-                    // All dropped, need to poll again
-                    continue;
-                } else {
-                    return Poll::Ready(Ok(valid));
+                    continue; // all dropped; poll again
                 }
+                return Poll::Ready(Ok(valid));
             }
         }
     }
@@ -1687,6 +1684,37 @@ mod tests {
                 .is_err(),
             "a cookie we already held bought another Initial"
         );
+    }
+
+    /// The receive path counted survivors with one predicate and compacted
+    /// with another. A zero-length datagram sits exactly in the gap: it is not
+    /// an Initial, so `validate_and_strip` passes it through and it was
+    /// counted — but it has no length, so the compaction skipped it, and quinn
+    /// could be handed a count covering an entry nothing had written.
+    ///
+    /// There is nothing in an empty datagram for quinn to parse, so it is
+    /// dropped and reported as what it is: nothing.
+    #[tokio::test]
+    async fn a_zero_length_datagram_is_not_reported_as_a_packet() {
+        let (server, _client) = pair().await;
+        let server_addr = server.io.local_addr().unwrap();
+
+        let sender = socket().await;
+        sender.send_to(&[], server_addr).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut b = [0u8; 2048];
+        let mut bufs = [std::io::IoSliceMut::new(&mut b)];
+        let mut metas = [quinn::udp::RecvMeta::default()];
+        match server.poll_recv(&mut cx, &mut bufs, &mut metas) {
+            Poll::Pending => {}
+            Poll::Ready(Ok(n)) => panic!(
+                "reported {n} packet(s) for a zero-length datagram, with meta.len = {}",
+                metas[0].len
+            ),
+            Poll::Ready(Err(e)) => panic!("poll_recv errored: {e}"),
+        }
     }
 
     /// A dual-stack socket may report an IPv4 peer either way round, and the
