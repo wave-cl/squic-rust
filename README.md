@@ -8,7 +8,7 @@ Rust implementation of sQUIC, wrapping [Quinn](https://github.com/quinn-rs/quinn
 2. **No CA/PKI** — identity is a pinned Ed25519 public key (32 bytes). No certificate authorities.
 3. **Client whitelisting** — runtime-manageable set of allowed client keys. Non-whitelisted clients are silently dropped at the MAC layer.
 4. **Persistent client identity** — optional `client_key` config for stable client identity across reconnects, enabling server-side whitelisting.
-5. **Replay protection** — 120-second timestamp window + 8-byte cryptographic nonce per packet.
+5. **Replay window** — a 120-second timestamp window bounds how long a captured Initial stays usable. It is *not* full replay protection: the 8-byte nonce feeds MAC1 but is never tracked, so a server keeps no set of nonces it has seen and an Initial captured from the wire can be replayed verbatim within the window and will be accepted. This is deliberate — a seen-nonce cache would hand an unauthenticated caller per-caller state to allocate — and the bound is that a replayer holds no private key, so it cannot finish the handshake. See [SIP-6](https://github.com/wave-cl/sips/blob/main/sip-0006.md), *The replay window, and what the nonce is not*.
 6. **DDoS resistance** — WireGuard-style MAC2 + cookie mechanism. Under load, the server requires proof-of-address before performing expensive DH operations.
 7. **Interoperable** — same wire format as squic-go. Go server + Rust client (and vice versa) work together.
 
