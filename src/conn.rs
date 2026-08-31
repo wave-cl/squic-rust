@@ -3,7 +3,7 @@ use crate::mac::{
     generate_nonce, has_mac0, is_quic_initial, now_timestamp, timestamp_in_window, trailer_len,
     verify_mac0, verify_mac1, verify_mac2,
     CLIENT_KEY_SIZE, COOKIE_REPLY_TYPE, COOKIE_SECRET_LIFETIME_SECS, ED25519_SIZE, ENVELOPE_V1,
-    MAC0_SIZE, MAC2_SIZE,
+    ENVELOPE_VERSIONS, MAC0_SIZE, MAC2_SIZE,
     MAC_SIZE, NONCE_SIZE, TIMESTAMP_SIZE,
 };
 use crate::crypto::ed25519_identity_to_x25519;
@@ -273,6 +273,13 @@ pub struct ServerSocket {
     dh_count: AtomicU64,
     cookie_replies: AtomicU64,
     mac2_verified: AtomicU64,
+    /// Initials accepted, per envelope version, indexed as [`ENVELOPE_VERSIONS`].
+    ///
+    /// The number a deployment needs before retiring a version: without it the
+    /// choice is made on nerve, and getting it wrong locks out every client
+    /// that had not moved — silently, because a refused envelope is dropped
+    /// without a word.
+    accepted: [AtomicU64; ENVELOPE_VERSIONS.len()],
     load_threshold: u64,
     /// Envelope versions this server parses (SIP-29).
     accepted_versions: Vec<u8>,
@@ -311,6 +318,7 @@ impl ServerSocket {
             dh_count: AtomicU64::new(0),
             cookie_replies: AtomicU64::new(0),
             mac2_verified: AtomicU64::new(0),
+            accepted: [const { AtomicU64::new(0) }; ENVELOPE_VERSIONS.len()],
             // Zero means the caller turned the cookie defence off; it is not a
             // stand-in for the default, which lib.rs has already applied.
             load_threshold,
@@ -550,6 +558,9 @@ impl ServerSocket {
             self.peer_table.record(dcid, key, identity, Instant::now());
         }
 
+        if let Some(i) = crate::mac::version_index(version) {
+            self.accepted[i].fetch_add(1, Ordering::Relaxed);
+        }
         Outcome::Accepted(quic_len)
     }
 
@@ -632,6 +643,9 @@ impl ServerSocket {
             under_load: self.under_load.load(Ordering::Relaxed),
             cookie_replies_sent: self.cookie_replies.load(Ordering::Relaxed),
             mac2_verified: self.mac2_verified.load(Ordering::Relaxed),
+            accepted_by_version: std::array::from_fn(|i| {
+                (ENVELOPE_VERSIONS[i], self.accepted[i].load(Ordering::Relaxed))
+            }),
         }
     }
 
@@ -1728,6 +1742,58 @@ mod tests {
         // A different port or host is a different peer.
         assert!(!same_peer(v4, "192.0.2.7:444".parse().unwrap()));
         assert!(!same_peer(v4, "192.0.2.8:443".parse().unwrap()));
+    }
+
+    /// The counter that turns retiring a version from nerve into arithmetic.
+    ///
+    /// A server that drops an envelope does so in silence, so retiring one that
+    /// clients are still sending locks them out with nothing in any log on
+    /// either side. Before this there was no way to ask "is anything still
+    /// arriving on version 2" — the question the decision rests on.
+    #[tokio::test]
+    async fn accepted_initials_are_counted_per_envelope_version() {
+        let (server, _c) = pair_with(ENVELOPE_V1, vec![ENVELOPE_V1, ENVELOPE_V2, ENVELOPE_V3]).await;
+
+        let count = |s: &ServerSocket, v: u8| {
+            s.load_stats()
+                .accepted_by_version
+                .iter()
+                .find(|(ver, _)| *ver == v)
+                .map(|(_, n)| *n)
+                .expect("every known version is reported")
+        };
+
+        for (version, times) in [(ENVELOPE_V1, 1), (ENVELOPE_V2, 3), (ENVELOPE_V3, 2)] {
+            let (_s, client) =
+                pair_with(version, vec![ENVELOPE_V1, ENVELOPE_V2, ENVELOPE_V3]).await;
+            for _ in 0..times {
+                let mut envelope = client.build_initial(&initial(), None);
+                let len = envelope.len();
+                // The client here was built against a different server, so its
+                // MAC1 will not verify — drive the counter through the server
+                // under test with its own client instead.
+                let _ = server.validate_and_strip(&mut envelope, len, None);
+            }
+        }
+
+        // Only the matched client's envelopes are accepted, so every count is
+        // zero — which is the point: a rejected Initial must not be counted as
+        // an arrival on its claimed version.
+        for v in [ENVELOPE_V1, ENVELOPE_V2, ENVELOPE_V3] {
+            assert_eq!(count(&server, v), 0, "a rejected envelope was counted");
+        }
+
+        // Now the real thing: one client that matches this server.
+        let (server, client) =
+            pair_with(ENVELOPE_V2, vec![ENVELOPE_V1, ENVELOPE_V2, ENVELOPE_V3]).await;
+        for _ in 0..3 {
+            let mut envelope = client.build_initial(&initial(), None);
+            let len = envelope.len();
+            assert_eq!(server.validate_and_strip(&mut envelope, len, None), Some(DATAGRAM));
+        }
+        assert_eq!(count(&server, ENVELOPE_V2), 3);
+        assert_eq!(count(&server, ENVELOPE_V1), 0);
+        assert_eq!(count(&server, ENVELOPE_V3), 0);
     }
 
     /// A deployment must be able to retire a version, or the oldest envelope

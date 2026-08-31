@@ -55,6 +55,19 @@ pub const MAC0_SIZE: usize = 16;
 /// Size of the version marker.
 pub const VERSION_SIZE: usize = 1;
 
+/// Every envelope version this build knows, lowest first.
+///
+/// The one list to extend when a version is added — `trailer_len` and the
+/// per-version accept counters are both keyed off it, and
+/// `every_known_version_has_a_trailer` fails if the two drift apart.
+pub const ENVELOPE_VERSIONS: [u8; 3] = [ENVELOPE_V1, ENVELOPE_V2, ENVELOPE_V3];
+
+/// The position of `version` in [`ENVELOPE_VERSIONS`], for indexing per-version
+/// state. `None` for a version this build does not know.
+pub fn version_index(version: u8) -> Option<usize> {
+    ENVELOPE_VERSIONS.iter().position(|&v| v == version)
+}
+
 /// Trailer width for envelope version 2.
 pub const MAC_OVERHEAD_V2: usize = MAC_OVERHEAD + VERSION_SIZE;
 
@@ -412,6 +425,19 @@ mod tests {
 
         let got = compute_mac1(ENVELOPE_V1, &secret, data, &ed, ts, &nonce);
         assert_eq!(&got[..], &expected[..MAC_SIZE]);
+    }
+
+    /// The list and the width table are two statements of the same fact, and a
+    /// version added to one and not the other is a silent hole: an envelope
+    /// counted but never parsed, or parsed but never counted.
+    #[test]
+    fn every_known_version_has_a_trailer() {
+        for v in ENVELOPE_VERSIONS {
+            assert!(trailer_len(v).is_some(), "version {v} has no trailer width");
+            assert!(version_index(v).is_some());
+        }
+        assert_eq!(version_index(0), None);
+        assert_eq!(version_index(200), None);
     }
 
     #[test]

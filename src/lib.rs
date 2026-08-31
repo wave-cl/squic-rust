@@ -254,6 +254,17 @@ pub struct LoadStats {
     pub cookie_replies_sent: u64,
     /// Initial packets accepted on a valid MAC2 since start.
     pub mac2_verified: u64,
+    /// Initials accepted, per envelope version, as `(version, count)`.
+    ///
+    /// The number to look at before retiring a version (SIP-29). A server that
+    /// drops an envelope does so in silence, so retiring one that clients are
+    /// still sending locks them out with no diagnostic on either side — this is
+    /// the evidence that turns that decision from nerve into arithmetic.
+    ///
+    /// Counts accepted Initials, not connections: a handshake retransmits, so
+    /// treat these as "is anything still arriving on this version", not as a
+    /// connection count.
+    pub accepted_by_version: [(u8, u64); crate::mac::ENVELOPE_VERSIONS.len()],
 }
 
 /// Server listener with silent-server support.
