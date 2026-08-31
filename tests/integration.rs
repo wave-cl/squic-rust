@@ -1,5 +1,6 @@
 use squic::{self, Config};
 use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// Helper: start a server and return (listener, public key hex).
@@ -143,6 +144,114 @@ async fn test_version_gate_does_not_break_the_handshake() {
 
     drop(conn);
     let _ = server_task.await;
+}
+
+/// quinn answers a short-header packet for a connection it does not know with a
+/// **stateless reset**, provided the destination CID passes its generator's
+/// `validate`. That is a reply to a caller who has proved nothing, and it is
+/// what squic-go closes by leaving `StatelessResetKey` nil. quinn offers no
+/// such switch, so squic-rust had it on by default.
+///
+/// A genuine CID is needed to test it: a random one would fail quinn's default
+/// `validate` about 2^40 times out of 2^40 and the test would pass whether or
+/// not the hole was open. So this relays a real connection, records the
+/// destination CID the client puts on its 1-RTT packets — a CID the *server*
+/// issued — then closes the connection and probes with it.
+#[tokio::test]
+async fn test_no_stateless_reset_for_a_server_issued_cid() {
+    let (listener, _key, pub_key) = start_server(Config::default()).await;
+    let addr = listener.local_addr().unwrap();
+
+    // A relay that notes the DCID of the first short-header packet going up.
+    let seen: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
+    let front = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let back = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let front_addr = front.local_addr().unwrap();
+    back.connect(addr).await.unwrap();
+    {
+        let seen = Arc::clone(&seen);
+        tokio::spawn(async move {
+            let mut up = vec![0u8; 65536];
+            let mut down = vec![0u8; 65536];
+            let mut client: Option<SocketAddr> = None;
+            loop {
+                tokio::select! {
+                    Ok((n, from)) = front.recv_from(&mut up) => {
+                        client = Some(from);
+                        // Short header: header-form clear, fixed bit set. The
+                        // DCID follows the first byte and is 8 bytes wide.
+                        if n >= 9 && up[0] & 0xC0 == 0x40 {
+                            let mut slot = seen.lock().unwrap();
+                            if slot.is_none() {
+                                *slot = Some(up[1..9].to_vec());
+                            }
+                        }
+                        let _ = back.send(&up[..n]).await;
+                    }
+                    Ok(n) = back.recv(&mut down) => {
+                        if let Some(c) = client {
+                            let _ = front.send_to(&down[..n], c).await;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    let server_task = tokio::spawn(async move {
+        let incoming = listener.accept().await.unwrap();
+        let conn = incoming.await.unwrap();
+        let (mut s, mut r) = conn.accept_bi().await.unwrap();
+        let mut buf = vec![0u8; 16];
+        let n = r.read(&mut buf).await.unwrap().unwrap();
+        s.write_all(&buf[..n]).await.unwrap();
+        s.finish().unwrap();
+        let _ = s.stopped().await;
+        listener
+    });
+
+    let conn = squic::dial(front_addr, &pub_key, Config::default())
+        .await
+        .expect("dial through the relay");
+    let (mut s, mut r) = conn.open_bi().await.unwrap();
+    s.write_all(b"x").await.unwrap();
+    s.finish().unwrap();
+    let mut buf = vec![0u8; 16];
+    let _ = r.read(&mut buf).await.unwrap();
+
+    let cid = seen
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("relay saw no short-header packet, so no server CID was captured");
+    assert_eq!(cid.len(), 8);
+
+    // Retire it: close the connection so the CID is no longer routable.
+    conn.close(0u32.into(), b"done");
+    let listener = server_task.await.unwrap();
+    drop(conn);
+
+    // Probe with the genuine, now-unroutable CID. quinn drains a closed
+    // connection for a few PTOs before the CID leaves its index, so keep
+    // probing well past that — the reset appears once draining ends.
+    let probe = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mut pkt = vec![0u8; 64];
+    pkt[0] = 0x40; // short header, fixed bit set
+    pkt[1..9].copy_from_slice(&cid);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut reply = [0u8; 2048];
+    while tokio::time::Instant::now() < deadline {
+        probe.send_to(&pkt, addr).await.unwrap();
+        if let Ok(Ok((n, _))) = tokio::time::timeout(
+            Duration::from_millis(200),
+            probe.recv_from(&mut reply),
+        )
+        .await
+        {
+            panic!("server answered a short header bearing one of its own retired CIDs with {n} bytes — that is a stateless reset, and it proves the server exists");
+        }
+    }
+    drop(listener);
 }
 
 #[tokio::test]

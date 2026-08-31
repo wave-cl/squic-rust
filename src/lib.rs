@@ -31,6 +31,79 @@ fn create_udp_socket(addr: SocketAddr) -> std::result::Result<std::net::UdpSocke
     Ok(sock.into())
 }
 
+/// Connection IDs that are unguessable and that this endpoint recognises for
+/// nothing after the fact.
+///
+/// quinn sends a **stateless reset** when a short-header packet arrives for a
+/// connection it does not know, provided the destination CID passes the
+/// generator's `validate` — a reply to a caller that has proved nothing, which
+/// is exactly what a silent server must not send. squic-go closes this by
+/// leaving `StatelessResetKey` nil; quinn 0.11 has no equivalent, because
+/// `EndpointConfig::new` requires a reset key and `Default` fills a random one,
+/// so the reply is on by default and there is no switch to turn it off.
+///
+/// `validate` is consulted in exactly one place in quinn — the gate in front of
+/// that reset (`endpoint.rs`, the `!is_initial() && validate(..).is_err()`
+/// branch). Live traffic never reaches it: a packet for a connection the
+/// endpoint knows is routed by the connection index several branches earlier.
+/// So refusing every CID here makes the reset unreachable and costs a
+/// legitimate peer nothing.
+///
+/// The CIDs are random for a second reason. quinn's default
+/// `HashedConnectionIdGenerator` signs an 8-byte CID with five bytes of
+/// `rustc_hash::FxHasher` keyed on a `u64` — a non-cryptographic, algebraically
+/// invertible hash, over CIDs that travel in cleartext in the server's own
+/// long-header packets. Recovering that key from a handful of observed CIDs is
+/// arithmetic, after which an attacker mints CIDs that validate. Random CIDs
+/// carry nothing to recover.
+///
+/// The cost is the one squic-go already accepts: a peer whose server has
+/// forgotten it waits out `max_idle_timeout` instead of being told at once.
+#[derive(Debug, Clone, Copy, Default)]
+struct SilentCidGenerator;
+
+/// Eight bytes, matching quinn's own default.
+const CID_LEN: usize = 8;
+
+impl quinn::ConnectionIdGenerator for SilentCidGenerator {
+    fn generate_cid(&mut self) -> quinn::ConnectionId {
+        let mut bytes = [0u8; CID_LEN];
+        getrandom::fill(&mut bytes).expect("getrandom failed");
+        quinn::ConnectionId::new(&bytes)
+    }
+
+    /// Recognise nothing. The trait permits false positives here and this is
+    /// the opposite — a false negative for every CID, including our own — whose
+    /// only effect at quinn's single call site is to drop a packet that would
+    /// otherwise have been answered with a stateless reset.
+    fn validate(&self, _cid: &quinn::ConnectionId) -> Result<(), quinn_proto::InvalidCid> {
+        Err(quinn_proto::InvalidCid)
+    }
+
+    fn cid_len(&self) -> usize {
+        CID_LEN
+    }
+
+    fn cid_lifetime(&self) -> Option<Duration> {
+        None
+    }
+}
+
+/// The endpoint configuration both ends use.
+///
+/// `EndpointConfig::default()` is not usable as-is: it enables stateless resets
+/// and it picks a CID generator whose signature can be forged. See
+/// [`SilentCidGenerator`].
+fn endpoint_config() -> quinn::EndpointConfig {
+    let mut config = quinn::EndpointConfig::default();
+    config.cid_generator(|| Box::<SilentCidGenerator>::default());
+    // Belt and braces. With `validate` refusing everything the reset is already
+    // unreachable, but this is the only other lever quinn offers and the
+    // property should not rest on one of them alone.
+    config.min_reset_interval(Duration::from_secs(86_400));
+    config
+}
+
 /// Errors returned by sQUIC operations.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -367,7 +440,7 @@ pub async fn listen(
         .ok_or_else(|| Error::Io(std::io::Error::other("no async runtime")))?;
 
     let endpoint = quinn::Endpoint::new_with_abstract_socket(
-        quinn::EndpointConfig::default(),
+        endpoint_config(),
         Some(server_config),
         server_socket.clone(),
         runtime,
@@ -455,7 +528,7 @@ pub async fn dial(
         .ok_or_else(|| Error::Io(std::io::Error::other("no async runtime")))?;
 
     let mut endpoint = quinn::Endpoint::new_with_abstract_socket(
-        quinn::EndpointConfig::default(),
+        endpoint_config(),
         None,
         Arc::new(client_socket),
         runtime,
@@ -481,4 +554,48 @@ pub fn generate_keypair() -> (SigningKey, [u8; 32]) {
 /// Load a keypair from a hex-encoded Ed25519 private seed.
 pub fn load_keypair(hex_seed: &str) -> Result<(SigningKey, [u8; 32]), Error> {
     crypto::load_keypair(hex_seed)
+}
+
+#[cfg(test)]
+mod endpoint_config_tests {
+    use super::*;
+    use quinn::ConnectionIdGenerator;
+    use quinn_proto::HashedConnectionIdGenerator;
+
+    /// The property that closes the hole: our generator recognises nothing,
+    /// including its own output, so quinn's stateless-reset gate never opens.
+    #[test]
+    fn our_generator_recognises_nothing_not_even_its_own_cids() {
+        let mut cids = SilentCidGenerator;
+        let cid = cids.generate_cid();
+        assert_eq!(cid.len(), CID_LEN);
+        assert!(
+            cids.validate(&cid).is_err(),
+            "a CID we minted ourselves still validates, so the reset gate is open"
+        );
+    }
+
+    /// And the contrast that makes it worth doing. quinn's default validates
+    /// its own CIDs, which is what let a retired one draw a stateless reset —
+    /// and it signs them with five bytes of a non-cryptographic, algebraically
+    /// invertible hash over CIDs that travel in cleartext, so the signature is
+    /// recoverable rather than merely guessable.
+    #[test]
+    fn quinns_default_generator_validates_its_own_cids() {
+        let mut cids = HashedConnectionIdGenerator::default();
+        let cid = cids.generate_cid();
+        assert!(
+            cids.validate(&cid).is_ok(),
+            "quinn changed its default; re-check whether the reset gate still needs closing here"
+        );
+    }
+
+    /// CIDs must not repeat, or connections collide.
+    #[test]
+    fn generated_cids_are_distinct() {
+        let mut cids = SilentCidGenerator;
+        let a = cids.generate_cid();
+        let b = cids.generate_cid();
+        assert_ne!(a.as_ref(), b.as_ref());
+    }
 }
