@@ -11,7 +11,7 @@ use quinn::udp::{RecvMeta, Transmit, UdpSocketState};
 use quinn::AsyncUdpSocket;
 use std::io;
 use std::net::SocketAddr;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::task::{Context, Poll};
@@ -26,10 +26,21 @@ use x25519_dalek::{PublicKey as X25519Public, StaticSecret as X25519Secret};
 /// between the first Initial and `accept`, which is sub-second in practice.
 const PEER_KEY_TTL: Duration = Duration::from_secs(30);
 
-/// Above this many live entries, an insert first drops the expired ones. Keeps
-/// the table bounded without a background task; the bound is generous because
-/// each entry is tiny and the healthy steady state is near-empty.
-const PEER_TABLE_PRUNE_AT: usize = 512;
+/// The most insertion records the table will hold, and so the most live
+/// entries — every live entry owns exactly one record.
+///
+/// The table is filled by anything that passes MAC1, which without a whitelist
+/// is anyone holding the server's public key: a value that is *published*,
+/// being the tail of the connection string. The previous arrangement pruned
+/// only *expired* entries and then inserted regardless, so it freed nothing
+/// whenever arrivals outran the TTL — which is exactly what an attacker
+/// arranges — and the table grew without limit while every insert paid for a
+/// full scan that reclaimed nothing.
+///
+/// At roughly 250 bytes an entry this bounds the table to about 4 MB. The
+/// healthy steady state is near-empty: an entry lives from the first Initial
+/// to `accept`, which is sub-second.
+const PEER_TABLE_MAX: usize = 16_384;
 
 struct PeerEntry {
     key: [u8; 32],
@@ -48,7 +59,52 @@ struct PeerEntry {
 /// who it is talking to. See SIP-2.
 #[derive(Default)]
 struct PeerTable {
-    map: Mutex<HashMap<Vec<u8>, PeerEntry>>,
+    inner: Mutex<Inner>,
+}
+
+/// The map and the insertion order that bounds it.
+#[derive(Default)]
+struct Inner {
+    map: HashMap<Vec<u8>, PeerEntry>,
+    /// One record per entry, in insertion order, so expiry and eviction are
+    /// both amortised O(1) and neither scans the map.
+    ///
+    /// A record is appended once, when the entry is first recorded, and its
+    /// timestamp never changes — which is what makes the front always the
+    /// oldest. A record whose timestamp no longer matches the map (the entry
+    /// was drained, or evicted and re-recorded since) is stale, and is
+    /// discarded without touching whatever is there now.
+    order: VecDeque<(Instant, Vec<u8>)>,
+}
+
+impl Inner {
+    /// Drop the oldest record, and the entry it names if that entry is still
+    /// the one the record refers to. Returns whether a live entry went with it.
+    fn drop_front(&mut self) -> bool {
+        let Some((recorded, dcid)) = self.order.pop_front() else {
+            return false;
+        };
+        match self.map.get(&dcid) {
+            Some(e) if e.inserted == recorded => {
+                self.map.remove(&dcid);
+                true
+            }
+            _ => false, // stale record; the entry it named is already gone
+        }
+    }
+
+    /// Drop everything past its TTL. Timestamps never change and records are
+    /// appended in order, so the front is always the oldest and this stops at
+    /// the first live one — no scan, and no dependence on how full the table is.
+    fn expire(&mut self, now: Instant) {
+        while self
+            .order
+            .front()
+            .is_some_and(|(t, _)| now.duration_since(*t) >= PEER_KEY_TTL)
+        {
+            self.drop_front();
+        }
+    }
 }
 
 impl PeerTable {
@@ -60,35 +116,70 @@ impl PeerTable {
     /// could otherwise overwrite a victim's entry — so the entry is poisoned
     /// and will answer for neither key.
     fn record(&self, dcid: &[u8], key: [u8; 32], identity: Option<[u8; 32]>, now: Instant) {
-        let mut map = self.map.lock().unwrap();
-        if map.len() >= PEER_TABLE_PRUNE_AT {
-            map.retain(|_, e| now.duration_since(e.inserted) < PEER_KEY_TTL);
-        }
-        match map.get_mut(dcid) {
-            Some(e) if e.poisoned => {}
-            Some(e) if e.key == key && e.identity == identity => e.inserted = now,
-            Some(e) => e.poisoned = true,
-            None => {
-                map.insert(
-                    dcid.to_vec(),
-                    PeerEntry { key, identity, inserted: now, poisoned: false },
-                );
+        let mut inner = self.inner.lock().unwrap();
+
+        // An entry that is already here is settled in place, ahead of any
+        // expiry or eviction, so a live connection is never turned away by
+        // pressure a flood created a moment ago.
+        //
+        // A retransmission no longer extends the entry: it lives its TTL from
+        // when it was first seen. That is what lets the order queue be exact —
+        // a timestamp that never moves means the front is always the oldest —
+        // and it stops a peer holding an entry open indefinitely by
+        // retransmitting. The TTL is 30s against a 10s handshake timeout, so
+        // the first sighting already covers the whole handshake.
+        match inner.map.get_mut(dcid) {
+            Some(e) if e.poisoned => return,
+            Some(e) if e.key == key && e.identity == identity => return,
+            Some(e) => {
+                e.poisoned = true;
+                return;
             }
+            None => {}
         }
+
+        inner.expire(now);
+
+        // Every live entry owns exactly one record, so bounding the queue
+        // bounds the map. Dropping from the front evicts the oldest, which is
+        // the right end: a legitimate caller's entry is read within
+        // milliseconds of being written, so it is the newest thing here and
+        // the last to go.
+        //
+        // Under a flood heavy enough to fill this, some legitimate peer keys
+        // will be evicted before their connection is accepted, and those
+        // connections are then anonymous. That is a refusal at every consumer
+        // that fails closed, which is the correct way to lose: the alternative
+        // this replaces was unbounded growth and a quadratic prune under the
+        // lock on the receive path, which loses everything.
+        while inner.order.len() >= PEER_TABLE_MAX {
+            inner.drop_front();
+        }
+
+        inner
+            .map
+            .insert(dcid.to_vec(), PeerEntry { key, identity, inserted: now, poisoned: false });
+        inner.order.push_back((now, dcid.to_vec()));
     }
 
     /// Return the (key, identity) recorded for `dcid`, if one is present, not
     /// poisoned, and not expired. This is a peek, not a drain: an application may
     /// read the peer key and the peer identity separately for one connection
     /// (SIP-2 + SIP-3), so both accessors must resolve. The table is bounded by
-    /// the TTL and the prune-on-insert instead.
+    /// the TTL and by [`PEER_TABLE_MAX`] instead.
     fn get(&self, dcid: &[u8], now: Instant) -> Option<([u8; 32], Option<[u8; 32]>)> {
-        let map = self.map.lock().unwrap();
-        let entry = map.get(dcid)?;
+        let inner = self.inner.lock().unwrap();
+        let entry = inner.map.get(dcid)?;
         if entry.poisoned || now.duration_since(entry.inserted) >= PEER_KEY_TTL {
             return None;
         }
         Some((entry.key, entry.identity))
+    }
+
+    /// Live entries, for the tests that pin the bound.
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.inner.lock().unwrap().map.len()
     }
 }
 
@@ -1280,6 +1371,74 @@ mod peer_table_tests {
         t.record(b"cid1", [1u8; 32], None, start);
         let later = start + PEER_KEY_TTL + Duration::from_secs(1);
         assert_eq!(t.get(b"cid1", later), None);
+    }
+
+    /// The finding this replaces: the old prune dropped only *expired* entries
+    /// and then inserted regardless, so when arrivals outran the TTL it freed
+    /// nothing and the table grew without limit — while every insert past the
+    /// threshold paid for a full scan that reclaimed nothing, under the lock,
+    /// on the receive path. A peer that can pass MAC1 could drive both.
+    #[test]
+    fn table_is_bounded_by_a_flood_of_fresh_entries() {
+        let t = PeerTable::default();
+        let now = Instant::now();
+        for i in 0..(PEER_TABLE_MAX * 3) {
+            // Every one distinct, every one fresh: nothing is ever expired, so
+            // the old prune would have reclaimed nothing on any of these.
+            t.record(&(i as u64).to_be_bytes(), [1u8; 32], None, now);
+        }
+        assert!(
+            t.len() <= PEER_TABLE_MAX,
+            "table grew to {} entries, past the {PEER_TABLE_MAX} bound",
+            t.len()
+        );
+    }
+
+    /// Eviction takes from the oldest end, so the caller that just arrived —
+    /// whose key is read within milliseconds — is the last thing to go.
+    #[test]
+    fn the_newest_entry_survives_a_flood() {
+        let t = PeerTable::default();
+        let now = Instant::now();
+        for i in 0..(PEER_TABLE_MAX * 2) {
+            t.record(&(i as u64).to_be_bytes(), [1u8; 32], None, now);
+        }
+        t.record(b"mine", [7u8; 32], Some([8u8; 32]), now);
+        assert_eq!(t.get(b"mine", now), Some(([7u8; 32], Some([8u8; 32]))));
+    }
+
+    /// Expiry runs off the queue front rather than a scan, so it must still be
+    /// exact: everything past the TTL goes, everything inside it stays.
+    #[test]
+    fn expiry_takes_the_old_and_leaves_the_new() {
+        let t = PeerTable::default();
+        let start = Instant::now();
+        t.record(b"old", [1u8; 32], None, start);
+        let later = start + PEER_KEY_TTL + Duration::from_secs(1);
+        t.record(b"new", [2u8; 32], None, later);
+
+        assert_eq!(t.get(b"old", later), None, "past its TTL");
+        assert_eq!(t.get(b"new", later), Some(([2u8; 32], None)));
+        assert_eq!(t.len(), 1, "the expired entry was not reclaimed");
+    }
+
+    /// A retransmission no longer extends the entry — it lives its TTL from
+    /// first sight. That is what keeps the order queue exact, and it stops a
+    /// peer holding an entry open forever by retransmitting. 30s of TTL
+    /// against a 10s handshake timeout leaves the handshake covered either way.
+    #[test]
+    fn a_retransmission_does_not_extend_the_entry() {
+        let t = PeerTable::default();
+        let start = Instant::now();
+        t.record(b"cid1", [1u8; 32], None, start);
+        // Retransmitted most of a TTL later, and still resolving at that point.
+        let midway = start + Duration::from_secs(25);
+        t.record(b"cid1", [1u8; 32], None, midway);
+        assert_eq!(t.get(b"cid1", midway), Some(([1u8; 32], None)));
+
+        // Expiry is measured from the first sighting, not the last.
+        let past = start + PEER_KEY_TTL + Duration::from_secs(1);
+        assert_eq!(t.get(b"cid1", past), None);
     }
 
     #[test]
