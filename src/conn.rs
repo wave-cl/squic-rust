@@ -110,6 +110,33 @@ fn is_short_header(data: &[u8]) -> bool {
     !data.is_empty() && data[0] & 0xC0 == 0x40
 }
 
+/// A QUIC long header: the header-form bit is set. Initial, 0-RTT, Handshake
+/// and Retry all look like this.
+fn is_long_header(data: &[u8]) -> bool {
+    !data.is_empty() && data[0] & 0x80 != 0
+}
+
+/// The QUIC version of a long-header packet — bytes 1..5, big-endian.
+fn long_header_version(data: &[u8]) -> Option<u32> {
+    let v = data.get(1..5)?;
+    Some(u32::from_be_bytes([v[0], v[1], v[2], v[3]]))
+}
+
+/// Whether the QUIC stack behind us would parse this version.
+///
+/// The envelope gates Initials, but *every* long header reaches the QUIC
+/// stack, and a stack that does not recognise the version answers with a
+/// Version Negotiation packet — quinn decides this inside `PartialDecode::new`,
+/// before the Initial-header check and before it looks up the connection at
+/// all. That reply costs the caller no key and no captured traffic, so without
+/// this gate one datagram proves the server exists and SIP-6's silence is over.
+///
+/// The set is quinn's own constant rather than a copy, so the gate cannot drift
+/// away from the stack it is protecting.
+fn version_is_supported(version: u32) -> bool {
+    quinn_proto::DEFAULT_SUPPORTED_VERSIONS.contains(&version)
+}
+
 /// What one envelope-version attempt concluded (SIP-29).
 ///
 /// `Challenge` is reported rather than acted on, so that trying two layouts for
@@ -190,6 +217,23 @@ impl ServerSocket {
     /// about once in 256 packets. That costs one wasted parse before the
     /// fallback succeeds, and nothing at all for the other 255.
     fn validate_and_strip(&self, buf: &mut [u8], len: usize, addr: Option<SocketAddr>) -> Option<usize> {
+        // SIP-6 asks for silence toward anyone who cannot authenticate, and
+        // the envelope alone does not deliver it: a long header carrying a
+        // version the QUIC stack does not know draws a Version Negotiation
+        // reply out of it before any of the envelope's steps run. Drop those
+        // here, where the stack cannot see them.
+        //
+        // Only the unknown-version case. A long header the stack *does*
+        // recognise has to pass: the client's Handshake packets are
+        // long-headed too, and dropping every non-Initial long header would
+        // break every connection at the second flight. Those are silent
+        // already — quinn ignores a non-Initial long header for a connection
+        // it does not know.
+        if is_long_header(&buf[..len]) && !long_header_version(&buf[..len]).is_some_and(version_is_supported)
+        {
+            return None;
+        }
+
         if !is_quic_initial(&buf[..len]) {
             return Some(len); // non-Initial passes through
         }
@@ -956,7 +1000,7 @@ mod tests {
 
         // An Initial carrying that cookie must satisfy a server demanding one.
         server.set_under_load(true);
-        let datagram = vec![0xC0u8; 1200];
+        let datagram = quic_initial(1200);
         let mut envelope = client.build_initial(&datagram, Some(&cookie));
         let len = envelope.len();
 
@@ -975,7 +1019,7 @@ mod tests {
         let peer: SocketAddr = "127.0.0.1:40001".parse().unwrap();
         server.set_under_load(true);
 
-        let datagram = vec![0xC0u8; 1200];
+        let datagram = quic_initial(1200);
         let mut envelope = client.build_initial(&datagram, None);
         let len = envelope.len();
 
@@ -996,7 +1040,7 @@ mod tests {
         let secret = *server.cookie_secret.read().unwrap();
         let cookie = cookie_value(&secret, issued_to.ip());
 
-        let datagram = vec![0xC0u8; 1200];
+        let datagram = quic_initial(1200);
         let mut envelope = client.build_initial(&datagram, Some(&cookie));
         let len = envelope.len();
 
@@ -1014,7 +1058,7 @@ mod tests {
         let (server, _client) = pair().await;
         let peer: SocketAddr = "127.0.0.1:40404".parse().unwrap();
 
-        let datagram = vec![0xC0u8; 1200];
+        let datagram = quic_initial(1200);
         let zero_key = [0u8; 32];
         // The attacker assumes the exchange yields zeros, and is right.
         let assumed_shared = [0u8; 32];
@@ -1061,7 +1105,7 @@ mod tests {
         let (server, client) = pair().await;
         let peer: SocketAddr = "127.0.0.1:40003".parse().unwrap();
 
-        let datagram = vec![0xC0u8; 1200];
+        let datagram = quic_initial(1200);
         let mut envelope = client.build_initial(&datagram, None);
         let len = envelope.len();
 
@@ -1071,8 +1115,24 @@ mod tests {
 
     const DATAGRAM: usize = 1200;
 
+    /// A datagram shaped like a real QUIC v1 Initial: long header, version 1,
+    /// an 8-byte DCID.
+    ///
+    /// The version field is load-bearing in a fixture now. The server drops a
+    /// long header whose version its QUIC stack would not parse, so a buffer
+    /// filled with 0xC0 — whose version field reads 0xC0C0C0C0 — never reaches
+    /// the envelope at all, and a test built on one that asserts a *drop*
+    /// passes without exercising the thing it names.
+    fn quic_initial(len: usize) -> Vec<u8> {
+        let mut pkt = vec![0xC0u8; len];
+        pkt[1..5].copy_from_slice(&1u32.to_be_bytes()); // QUIC v1
+        pkt[5] = 8; // DCID length
+        pkt[6..14].copy_from_slice(&[0xA1u8; 8]); // DCID
+        pkt
+    }
+
     fn initial() -> Vec<u8> {
-        vec![0xC0u8; DATAGRAM]
+        quic_initial(DATAGRAM)
     }
 
     /// A version 2 client and a server that accepts version 2 agree on the

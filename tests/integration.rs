@@ -53,6 +53,8 @@ async fn test_silent_server_drops_invalid_mac() {
 
     // Send a fake QUIC Initial with wrong MAC
     let mut fake_initial = vec![0xC0u8; 200]; // looks like Initial
+    fake_initial[1..5].copy_from_slice(&1u32.to_be_bytes()); // QUIC v1, so this
+    // reaches MAC1 rather than being turned away at the version gate
     fake_initial.extend_from_slice(&[0u8; 52]); // fake overhead
     garbage_socket.send_to(&fake_initial, addr).await.unwrap();
 
@@ -70,6 +72,74 @@ async fn test_silent_server_drops_invalid_mac() {
     .await
     .expect("should not timeout")
     .expect("valid client should connect despite garbage");
+
+    drop(conn);
+    let _ = server_task.await;
+}
+
+/// SIP-6 promises silence to any caller that cannot authenticate, and the
+/// envelope does not deliver it on its own: it gates Initials, and every other
+/// long header reaches the QUIC stack untouched. A stack that does not
+/// recognise the version answers with a Version Negotiation packet before it
+/// has looked at the connection at all — no key, no captured traffic, one
+/// datagram.
+///
+/// This test listens for the reply. Every other silence test here asserts that
+/// a *legitimate* client still connects, which is why none of them could have
+/// caught this: the probe is a packet a sQUIC client never sends.
+#[tokio::test]
+async fn test_silent_server_answers_no_version_probe() {
+    let (listener, _key, _pub_key) = start_server(Config::default()).await;
+    let addr = listener.local_addr().unwrap();
+    let probe = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+    // Every long-header type, including the Initial — the version gate runs
+    // ahead of the envelope, so a bad version is dropped whatever the type.
+    // 1200 bytes because quic-go will not answer anything smaller; quinn has
+    // no such floor, so the Rust side is if anything easier to probe.
+    for first in [0xE0u8, 0xD0, 0xF0, 0xC0] {
+        let mut pkt = vec![0u8; 1200];
+        pkt[0] = first;
+        pkt[1..5].copy_from_slice(&0xDEAD_BEEFu32.to_be_bytes()); // no one supports this
+        pkt[5] = 0; // DCID length
+        pkt[6] = 0; // SCID length
+        probe.send_to(&pkt, addr).await.unwrap();
+
+        let mut reply = [0u8; 2048];
+        let got =
+            tokio::time::timeout(Duration::from_millis(300), probe.recv_from(&mut reply)).await;
+        assert!(
+            got.is_err(),
+            "server answered a {first:#04x} long header with an unsupported version \
+             ({} bytes) — a scanner just proved it exists",
+            got.unwrap().unwrap().0
+        );
+    }
+    drop(listener);
+}
+
+/// The other half, and the reason the gate is on the version rather than the
+/// packet type: a client's Handshake and 0-RTT packets are long-headed too, so
+/// a blanket drop of non-Initial long headers would break every connection at
+/// the second flight. A full handshake exercises that path.
+#[tokio::test]
+async fn test_version_gate_does_not_break_the_handshake() {
+    let (listener, _key, pub_key) = start_server(Config::default()).await;
+    let addr = listener.local_addr().unwrap();
+
+    let server_task = tokio::spawn(async move {
+        let incoming = listener.accept().await.unwrap();
+        let _conn = incoming.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    });
+
+    let conn = tokio::time::timeout(
+        Duration::from_secs(5),
+        squic::dial(addr, &pub_key, Config::default()),
+    )
+    .await
+    .expect("handshake timed out — the version gate is dropping live traffic")
+    .expect("handshake failed");
 
     drop(conn);
     let _ = server_task.await;
@@ -731,6 +801,11 @@ fn forge_initial(
     let datagram = {
         let mut d = vec![0u8; 1200];
         d[0] = 0xC0; // long header, fixed bit, Initial
+        // QUIC v1. The server drops a long header carrying a version its QUIC
+        // stack would not parse, and it does so before the envelope is read —
+        // so a forgery left at version 0 is refused for that reason alone, and
+        // the tests below would pass without ever reaching the check they name.
+        d[1..5].copy_from_slice(&1u32.to_be_bytes());
         d[5] = 8; // DCID length
         d
     };
