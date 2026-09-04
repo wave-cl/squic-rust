@@ -50,3 +50,11 @@ path = "examples/quinn_perf.rs"
 # in src/conn.rs for why squic declines coalescing rather than half-handling it.
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
+
+# Debug info is the bulk of a test binary on any target that embeds it — which
+# is Linux, and so CI. Our own crates keep full symbols; dependencies drop to
+# line tables, which still give file:line in a panic. macOS is unaffected
+# either way: it defaults to split-debuginfo=unpacked, so the debug info was
+# never in the binary there. Measured on x86_64-unknown-linux-gnu.
+[profile.dev.package."*"]
+debug = "line-tables-only"
