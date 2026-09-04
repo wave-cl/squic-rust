@@ -219,11 +219,26 @@ async fn test_no_stateless_reset_for_a_server_issued_cid() {
     let mut buf = vec![0u8; 16];
     let _ = r.read(&mut buf).await.unwrap();
 
-    let cid = seen
-        .lock()
-        .unwrap()
-        .clone()
-        .expect("relay saw no short-header packet, so no server CID was captured");
+    // Wait for the relay to see a short-header datagram, rather than assuming
+    // it already has. The read returning does not guarantee one: QUIC coalesces
+    // packets, so the client's first 1-RTT packet can ride in the same datagram
+    // behind a Handshake packet, leaving `up[0]` a long header that the relay
+    // does not match. A standalone short-header datagram follows within a few
+    // tens of milliseconds — the ACK for the response just read — but checking
+    // once, immediately, raced it and failed about one run in twenty.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let cid = loop {
+        if let Some(cid) = seen.lock().unwrap().clone() {
+            break cid;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "relay saw no short-header packet in 5s, so no server CID was \
+             captured — every datagram from the client was long-headed or \
+             coalesced behind a long header"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
     assert_eq!(cid.len(), 8);
 
     // Retire it: close the connection so the CID is no longer routable.
