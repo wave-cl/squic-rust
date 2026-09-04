@@ -1156,3 +1156,123 @@ fn the_client_default_is_version_3_and_servers_still_accept_the_older_ones() {
         assert!(config.accepted_envelope_versions.contains(&v));
     }
 }
+
+/// S9: a coalesced burst of Initials must still be accepted.
+///
+/// On Linux, `quinn_udp::UdpSocketState::new` opportunistically enables
+/// UDP_GRO, so the kernel can hand back one `RecvMeta` covering several
+/// datagrams. squic validates and strips the envelope before quinn sees the
+/// buffer, reading only `len`, so a coalesced run used to be MAC1'd as one
+/// giant datagram and dropped — silently, which is the failure mode this
+/// codebase exists to avoid. `socket_state` turns GRO back off; this guards it.
+///
+/// The two cases send byte-identical, individually valid Initials and differ
+/// only in how they reach the kernel. Case B is the control: if it ever fails,
+/// the harness is wrong and case A proves nothing, so it is asserted first.
+///
+/// Linux-only, deliberately: nothing coalesces elsewhere, and a test that
+/// passes by not exercising its condition is worse than no test.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_coalesced_burst_of_initials_is_still_accepted() {
+    use quinn::udp::{Transmit, UdpSockRef, UdpSocketState};
+    use squic::crypto::{ed25519_private_to_x25519, ed25519_public_to_x25519, x25519};
+    use squic::mac::{
+        ENVELOPE_V3, MAC2_SIZE, compute_mac0, compute_mac1, generate_nonce, mac0_key,
+        now_timestamp,
+    };
+    use std::net::UdpSocket;
+
+    const BURST: usize = 4;
+
+    let (listener, _key, server_pub) = start_server(Config::default()).await;
+    let addr = listener.local_addr().unwrap();
+
+    let (client_key, client_ed_pub) = squic::generate_keypair();
+    let client_x_priv = ed25519_private_to_x25519(&client_key);
+    let client_x_pub = ed25519_public_to_x25519(&client_ed_pub).unwrap();
+    let server_x_pub = ed25519_public_to_x25519(&server_pub).unwrap();
+    let shared = x25519(&client_x_priv, &server_x_pub).unwrap();
+    let k0 = mac0_key(server_x_pub.as_bytes());
+
+    // A v3 Initial. Bytes 1..5 must carry a QUIC version the server supports or
+    // S1's version gate drops it before MAC1 is reached — which is how the
+    // first draft of this test managed to refuse its own control.
+    let build = || {
+        let mut datagram = vec![0xC3u8; 1200];
+        datagram[1..5].copy_from_slice(&1u32.to_be_bytes());
+        let ts = now_timestamp();
+        let nonce = generate_nonce();
+        let ed_zero = [0u8; 32];
+        let mac1 = compute_mac1(ENVELOPE_V3, &shared, &datagram, &ed_zero, ts, &nonce);
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&datagram);
+        buf.extend_from_slice(client_x_pub.as_bytes());
+        buf.extend_from_slice(&ed_zero);
+        buf.extend_from_slice(&ts.to_be_bytes());
+        buf.extend_from_slice(&nonce);
+        buf.extend_from_slice(&compute_mac0(ENVELOPE_V3, &k0, &buf));
+        buf.extend_from_slice(&mac1);
+        buf.extend_from_slice(&[0u8; MAC2_SIZE]);
+        buf.push(ENVELOPE_V3);
+        buf
+    };
+
+    let accepted_v3 = || {
+        listener
+            .load_stats()
+            .accepted_by_version
+            .iter()
+            .find(|(v, _)| *v == ENVELOPE_V3)
+            .map(|(_, n)| *n)
+            .unwrap_or(0)
+    };
+
+    let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let tx_state = UdpSocketState::new(UdpSockRef::from(&tx)).unwrap();
+
+    // Control first: separate writes, nothing to coalesce.
+    let before = accepted_v3();
+    for _ in 0..BURST {
+        tx.send_to(&build(), addr).unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let separate = accepted_v3() - before;
+    assert_eq!(
+        separate, BURST as u64,
+        "control failed: plain Initials were refused, so this test cannot \
+         say anything about coalescing"
+    );
+
+    // The finding: the same Initials in one GSO write, which the kernel
+    // coalesces into a single RecvMeta on the way in.
+    let before = accepted_v3();
+    let mut blob = Vec::new();
+    for _ in 0..BURST {
+        blob.extend_from_slice(&build());
+    }
+    let one = build().len();
+    tx_state
+        .send(
+            UdpSockRef::from(&tx),
+            &Transmit {
+                destination: addr,
+                ecn: None,
+                contents: &blob,
+                segment_size: Some(one),
+                src_ip: None,
+            },
+        )
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let coalesced = accepted_v3() - before;
+
+    assert_eq!(
+        coalesced, BURST as u64,
+        "a coalesced burst of valid Initials was dropped ({coalesced} of {BURST} \
+         accepted) while the same packets sent separately were all accepted — \
+         GRO is back on, and a client retrying a handshake is being refused in \
+         silence"
+    );
+}

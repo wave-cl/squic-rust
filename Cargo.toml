@@ -1,6 +1,6 @@
 [package]
 name = "squic"
-version = "0.21.0"
+version = "0.22.0"
 edition = "2024"
 description = "Shielded QUIC: silent server, key-pinned identity, runtime client whitelisting"
 license = "MIT"
@@ -45,3 +45,8 @@ path = "examples/http3.rs"
 [[example]]
 name = "quinn_perf"
 path = "examples/quinn_perf.rs"
+
+# Linux only, for one setsockopt: turning UDP_GRO back off. See `socket_state`
+# in src/conn.rs for why squic declines coalescing rather than half-handling it.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"

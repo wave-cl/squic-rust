@@ -287,6 +287,54 @@ pub struct ServerSocket {
     peer_table: PeerTable,
 }
 
+/// Build the UDP socket state, with GRO turned back **off** on Linux.
+///
+/// `quinn_udp::UdpSocketState::new` opportunistically enables `UDP_GRO`, so the
+/// kernel may return one `RecvMeta` covering several coalesced datagrams: `len`
+/// is the total, `stride` the size of each. quinn handles that correctly — it
+/// splits by `stride` before parsing.
+///
+/// squic never gets that far. It validates and strips the envelope *before*
+/// quinn sees the buffer, reading only `len`, so a coalesced run is MAC1'd as
+/// one giant datagram and fails. Handling `stride` here is not a fix either:
+/// stripping removes a trailer only from Initials, and a different width per
+/// envelope version, so the survivors have non-uniform lengths that a single
+/// strided `RecvMeta` cannot express — and expanding one meta into several
+/// slots can overflow fixed-size arrays, since a coalesced meta carries up to
+/// 64 segments. So squic declines the optimisation instead of half-applying it.
+///
+/// This was measured, not reasoned about. On Linux 6.12, four identical and
+/// individually valid Initials sent in one GSO write arrived as a single
+/// 5300-byte `RecvMeta` with `stride` 1325 and **all four were dropped**; the
+/// same four sent separately were **all accepted**. That is a client retrying a
+/// handshake being refused in silence, which is the failure this whole codebase
+/// is meant not to have.
+///
+/// squic-go enables no GRO at all, so this also stops the two receive paths
+/// disagreeing about a security-relevant default — the standing complaint.
+fn socket_state(socket: &tokio::net::UdpSocket) -> UdpSocketState {
+    let state = UdpSocketState::new(socket.into()).expect("UdpSocketState::new");
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        // Kernel ABI constant; `libc::UDP_GRO` is not exposed on every target.
+        const UDP_GRO: libc::c_int = 104;
+        let off: libc::c_int = 0;
+        // Best effort by design: a kernel without UDP_GRO refuses this, and a
+        // kernel without UDP_GRO cannot coalesce, so it is already safe.
+        unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_UDP,
+                UDP_GRO,
+                std::ptr::addr_of!(off).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+    }
+    state
+}
+
 impl ServerSocket {
     pub fn new(
         socket: Arc<tokio::net::UdpSocket>,
@@ -295,7 +343,7 @@ impl ServerSocket {
         load_threshold: u64,
         accepted_versions: Vec<u8>,
     ) -> Self {
-        let inner = UdpSocketState::new((&*socket).into()).expect("UdpSocketState::new");
+        let inner = socket_state(&socket);
         let server_pub = X25519Public::from(&server_x25519_priv);
         let cookie_key = crate::mac::cookie_key(server_pub.as_bytes());
         let mac0_key = crate::mac::mac0_key(server_pub.as_bytes());
@@ -752,7 +800,11 @@ impl AsyncUdpSocket for ServerSocket {
     }
 
     fn max_receive_segments(&self) -> usize {
-        self.inner.gro_segments()
+        // One. `socket_state` turned GRO off, so nothing coalesces; reporting
+        // `gro_segments()` here would size buffers for segments that never
+        // arrive. The setsockopt is the load-bearing half — this only tells
+        // quinn what to expect, it does not stop the kernel.
+        1
     }
 }
 
@@ -818,7 +870,7 @@ impl ClientSocket {
             mac0_key,
             cookie_key,
         } = keys;
-        let inner = UdpSocketState::new((&*socket).into()).expect("UdpSocketState::new");
+        let inner = socket_state(&socket);
         Self {
             io: socket,
             inner,
@@ -1107,7 +1159,11 @@ impl AsyncUdpSocket for ClientSocket {
     }
 
     fn max_receive_segments(&self) -> usize {
-        self.inner.gro_segments()
+        // One. `socket_state` turned GRO off, so nothing coalesces; reporting
+        // `gro_segments()` here would size buffers for segments that never
+        // arrive. The setsockopt is the load-bearing half — this only tells
+        // quinn what to expect, it does not stop the kernel.
+        1
     }
 }
 
