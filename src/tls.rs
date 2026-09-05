@@ -50,7 +50,12 @@ pub fn server_tls_config(
         .map_err(|e| crate::Error::Tls(format!("server config: {e}")))?;
 
     config.alpn_protocols = alpn.to_vec();
-    config.max_early_data_size = 0; // No 0-RTT for now
+    // No 0-RTT, and not "for now": a 0-RTT datagram carries no envelope and
+    // cannot be given one, so accepting it would take application data from a
+    // caller who passed no gate, no MAC1 and no whitelist (SIP-6). The
+    // transport drops it as well — see `is_quic_zero_rtt`; this is the outer
+    // half of the same refusal.
+    config.max_early_data_size = 0;
     Ok(Arc::new(config))
 }
 

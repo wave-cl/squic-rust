@@ -2,8 +2,8 @@ use crate::mac::{
     CLIENT_KEY_SIZE, COOKIE_REPLY_TYPE, COOKIE_SECRET_LIFETIME_SECS, ED25519_SIZE,
     ENVELOPE_VERSIONS, GATE_SIZE, MAC_SIZE, TIMESTAMP_SIZE, TRAILER_WITH_IDENTITY, compute_gate,
     compute_mac1, cookie_value, ct_eq, decrypt_cookie, encrypt_cookie, hdr, hdr_has_identity,
-    hdr_version, is_quic_initial, now_timestamp, timestamp_in_window, trailer_len, verify_gate,
-    verify_mac1,
+    hdr_version, is_quic_initial, is_quic_zero_rtt, now_timestamp, timestamp_in_window,
+    trailer_len, verify_gate, verify_mac1,
 };
 use crate::crypto::ed25519_identity_to_x25519;
 use crate::whitelist::Whitelist;
@@ -398,6 +398,21 @@ impl ServerSocket {
         // it does not know.
         if is_long_header(&buf[..len]) && !long_header_version(&buf[..len]).is_some_and(version_is_supported)
         {
+            return None;
+        }
+
+        // 0-RTT carries no envelope and cannot be given one: it is sent before
+        // the handshake this transport authenticates, so there is no Initial of
+        // its own to wrap and no shared secret yet to key MAC1 with. A stack
+        // that accepts a standalone 0-RTT datagram is taking application data
+        // from a caller who passed no gate, no MAC1 and no whitelist. sQUIC
+        // does not support 0-RTT; this is where that is enforced.
+        //
+        // Only a datagram that *starts* with 0-RTT. One coalescing an Initial
+        // in front of it begins with 0xC0, so it is envelope-checked as a
+        // whole — MAC1 covers every byte, the 0-RTT among them — and quinn
+        // splits it afterwards.
+        if is_quic_zero_rtt(&buf[..len]) {
             return None;
         }
 
@@ -1816,6 +1831,41 @@ mod tests {
             None,
             "an unknown version was accepted"
         );
+    }
+
+    /// 0-RTT is application data offered *before* the handshake this transport
+    /// authenticates, so it arrives with no envelope on it at all — no gate, no
+    /// MAC1, and no X25519 field for SIP-8 to check a whitelist against. It has
+    /// to be refused.
+    ///
+    /// The refusal has to be specific, and the second half of this test is the
+    /// control that keeps it so: Handshake packets are long-headed too and
+    /// carry the client's second flight, so a drop written one bit wider would
+    /// break every connection while still passing the first assertion.
+    #[tokio::test]
+    async fn zero_rtt_is_dropped_and_the_second_flight_is_not() {
+        let (server, _client) = pair().await;
+
+        let mut zero_rtt = quic_initial(DATAGRAM);
+        zero_rtt[0] = 0xD0; // long header, packet type 0x01
+        let len = zero_rtt.len();
+        assert_eq!(
+            server.validate_and_strip(&mut zero_rtt, len, None),
+            None,
+            "an unauthenticated 0-RTT datagram reached the QUIC stack"
+        );
+
+        let mut handshake = quic_initial(DATAGRAM);
+        handshake[0] = 0xE0; // long header, packet type 0x02
+        assert_eq!(
+            server.validate_and_strip(&mut handshake, len, None),
+            Some(len),
+            "the client's second flight was dropped"
+        );
+
+        // And nothing was owed in reply. A refused 0-RTT datagram is silence,
+        // like every other drop in this path (SIP-6).
+        assert_eq!(server.cookie_replies.load(Ordering::Relaxed), 0);
     }
 }
 

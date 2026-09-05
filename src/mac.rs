@@ -296,6 +296,19 @@ pub fn is_quic_initial(data: &[u8]) -> bool {
     data.len() >= 5 && data[0] & 0xF0 == 0xC0
 }
 
+/// Check if a packet is a QUIC 0-RTT packet: long header, packet type 0x01.
+/// First byte & 0xF0 == 0xD0.
+///
+/// sQUIC does not carry 0-RTT. The envelope proves possession of the server's
+/// key and of a Diffie-Hellman shared secret, and it is attached to the
+/// Initial; a standalone 0-RTT datagram arrives with none of that, so a stack
+/// that accepts one is taking application data from a caller this transport
+/// has not authenticated — past the gate, past MAC1, and past the whitelist
+/// SIP-8 enforces on the X25519 field the datagram does not carry.
+pub fn is_quic_zero_rtt(data: &[u8]) -> bool {
+    data.len() >= 5 && data[0] & 0xF0 == 0xD0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -447,5 +460,15 @@ mod tests {
         assert!(!is_quic_initial(&[0xD0, 0, 0, 0, 1]), "0-RTT is not an Initial");
         assert!(!is_quic_initial(&[0x40, 0, 0, 0, 1]), "short header");
         assert!(!is_quic_initial(&[0xC0]));
+    }
+
+    #[test]
+    fn test_is_quic_zero_rtt() {
+        assert!(is_quic_zero_rtt(&[0xD0, 0, 0, 0, 1]));
+        assert!(is_quic_zero_rtt(&[0xDF, 0, 0, 0, 1]));
+        assert!(!is_quic_zero_rtt(&[0xC0, 0, 0, 0, 1]), "an Initial is not 0-RTT");
+        assert!(!is_quic_zero_rtt(&[0xE0, 0, 0, 0, 1]), "a Handshake is not 0-RTT");
+        assert!(!is_quic_zero_rtt(&[0x50, 0, 0, 0, 1]), "short header");
+        assert!(!is_quic_zero_rtt(&[0xD0]));
     }
 }
