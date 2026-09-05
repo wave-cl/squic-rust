@@ -1836,6 +1836,61 @@ mod tests {
         );
     }
 
+    /// A reserved header flag is refused, and the case that matters is a caller
+    /// who sets one **and computes its tags over it** — not a tampered byte.
+    ///
+    /// Tampering was never the risk: both tags cover the header as it arrived,
+    /// so a bit flipped in transit changes the tag input and fails on its own —
+    /// that is `a_flipped_header_is_dropped`. What this closes is a one-way
+    /// door. Before the check, a datagram like the ones below verified and was
+    /// admitted, because nothing looked at the bit; deployed servers would then
+    /// have been accepting these bits with no meaning attached, and a later
+    /// envelope version could not have given them one — it could not tell a
+    /// peer asserting a new flag from an older peer that set the bit for no
+    /// reason.
+    #[tokio::test]
+    async fn a_reserved_header_flag_is_refused_even_when_the_tags_agree() {
+        let (server, client) = pair().await;
+
+        // Build the envelope by hand so the header carrying the reserved bit is
+        // the same header both tags are computed over. build_initial derives its
+        // own header and could not produce this.
+        let build = |h: u8| {
+            let datagram = initial();
+            let mut buf = datagram;
+            buf.extend_from_slice(&client.client_pub_key);
+            buf.extend_from_slice(&now_timestamp().to_be_bytes());
+            let gate = compute_gate(h, &client.gate_key, &buf);
+            let mac1 = compute_mac1(h, &client.shared_secret, &buf);
+            buf.extend_from_slice(&gate);
+            buf.extend_from_slice(&mac1);
+            buf.push(h);
+            buf
+        };
+
+        for bit in [0x02u8, 0x04, 0x08] {
+            let mut env = build(hdr(ENVELOPE_V4, false) | bit);
+            let len = env.len();
+            assert_eq!(
+                server.validate_and_strip(&mut env, len, None),
+                None,
+                "reserved bit {bit:#04x} was admitted on an envelope whose tags agree with it"
+            );
+        }
+
+        // The control. The identical construction with no reserved bit set is
+        // accepted, so the refusals above are about the flag and not about the
+        // hand-built envelope being wrong in some other way.
+        let mut env = build(hdr(ENVELOPE_V4, false));
+        let len = env.len();
+        assert_eq!(
+            server.validate_and_strip(&mut env, len, None),
+            Some(len - TRAILER_ANON),
+            "the same envelope without a reserved bit was refused too — the \
+             fixture is wrong, so the refusals above prove nothing"
+        );
+    }
+
     /// 0-RTT is application data offered *before* the handshake this transport
     /// authenticates, so it arrives with no envelope on it at all — no gate, no
     /// MAC1, and no X25519 field for SIP-8 to check a whitelist against. It has

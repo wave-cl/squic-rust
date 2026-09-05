@@ -39,6 +39,21 @@ pub const ENVELOPE_V4: u8 = 4;
 /// Flag bit: a 32-byte Ed25519 identity follows the X25519 key (SIP-3).
 pub const FLAG_IDENTITY: u8 = 0x01;
 
+/// The header's remaining flag bits, which no version defines a meaning for.
+///
+/// Refused rather than ignored, and the reason is that ignoring them is a
+/// one-way door. Both tags cover the header byte as it arrived, so a client
+/// that sets a reserved bit *and computes its tags over it* would otherwise be
+/// admitted — the tags verify, and nothing else looks at the bit. Deployed
+/// servers would then be accepting these bits with no meaning attached, and a
+/// later version could not give them one: it would have no way to tell a peer
+/// asserting the new flag from an older peer that set the bit for no reason.
+///
+/// Tampering in transit was never the risk here — a flipped bit changes the
+/// tag input and fails. The risk is to the protocol's own future, and closing
+/// it costs nothing only while none of the bits are wanted.
+pub const FLAG_RESERVED: u8 = 0x0E;
+
 /// Every envelope version this build knows.
 ///
 /// The one list to extend when a version is added — `trailer_len` and the
@@ -86,6 +101,9 @@ const _: () = assert!(TRAILER_WITH_IDENTITY == 101, "TRAILER_WITH_IDENTITY chang
 /// that a receiver finds at the end of the datagram.
 pub fn trailer_len(hdr: u8) -> Option<usize> {
     if hdr_version(hdr) != ENVELOPE_V4 {
+        return None;
+    }
+    if hdr & FLAG_RESERVED != 0 {
         return None;
     }
     Some(if hdr_has_identity(hdr) {
