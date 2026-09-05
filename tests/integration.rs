@@ -1198,8 +1198,7 @@ async fn a_coalesced_burst_of_initials_is_still_accepted() {
     use quinn::udp::{Transmit, UdpSockRef, UdpSocketState};
     use squic::crypto::{ed25519_private_to_x25519, ed25519_public_to_x25519, x25519};
     use squic::mac::{
-        ENVELOPE_V3, MAC2_SIZE, compute_mac0, compute_mac1, generate_nonce, mac0_key,
-        now_timestamp,
+        ENVELOPE_V4, compute_gate, compute_mac1, gate_key, hdr, now_timestamp,
     };
     use std::net::UdpSocket;
 
@@ -1213,37 +1212,34 @@ async fn a_coalesced_burst_of_initials_is_still_accepted() {
     let client_x_pub = ed25519_public_to_x25519(&client_ed_pub).unwrap();
     let server_x_pub = ed25519_public_to_x25519(&server_pub).unwrap();
     let shared = x25519(&client_x_priv, &server_x_pub).unwrap();
-    let k0 = mac0_key(server_x_pub.as_bytes());
+    let kg = gate_key(server_x_pub.as_bytes());
 
-    // A v3 Initial. Bytes 1..5 must carry a QUIC version the server supports or
-    // S1's version gate drops it before MAC1 is reached — which is how the
-    // first draft of this test managed to refuse its own control.
+    // A v4 Initial. Bytes 1..5 must carry a QUIC version the server supports or
+    // S1's version gate drops it before the envelope is reached — which is how
+    // the first draft of this test managed to refuse its own control.
     let build = || {
         let mut datagram = vec![0xC3u8; 1200];
         datagram[1..5].copy_from_slice(&1u32.to_be_bytes());
+        let h = hdr(ENVELOPE_V4, false);
         let ts = now_timestamp();
-        let nonce = generate_nonce();
-        let ed_zero = [0u8; 32];
-        let mac1 = compute_mac1(ENVELOPE_V3, &shared, &datagram, &ed_zero, ts, &nonce);
         let mut buf = Vec::new();
         buf.extend_from_slice(&datagram);
         buf.extend_from_slice(client_x_pub.as_bytes());
-        buf.extend_from_slice(&ed_zero);
         buf.extend_from_slice(&ts.to_be_bytes());
-        buf.extend_from_slice(&nonce);
-        buf.extend_from_slice(&compute_mac0(ENVELOPE_V3, &k0, &buf));
+        let gate = compute_gate(h, &kg, &buf);
+        let mac1 = compute_mac1(h, &shared, &buf);
+        buf.extend_from_slice(&gate);
         buf.extend_from_slice(&mac1);
-        buf.extend_from_slice(&[0u8; MAC2_SIZE]);
-        buf.push(ENVELOPE_V3);
+        buf.push(h);
         buf
     };
 
-    let accepted_v3 = || {
+    let accepted_v4 = || {
         listener
             .load_stats()
             .accepted_by_version
             .iter()
-            .find(|(v, _)| *v == ENVELOPE_V3)
+            .find(|(v, _)| *v == ENVELOPE_V4)
             .map(|(_, n)| *n)
             .unwrap_or(0)
     };
@@ -1252,13 +1248,13 @@ async fn a_coalesced_burst_of_initials_is_still_accepted() {
     let tx_state = UdpSocketState::new(UdpSockRef::from(&tx)).unwrap();
 
     // Control first: separate writes, nothing to coalesce.
-    let before = accepted_v3();
+    let before = accepted_v4();
     for _ in 0..BURST {
         tx.send_to(&build(), addr).unwrap();
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     tokio::time::sleep(Duration::from_millis(300)).await;
-    let separate = accepted_v3() - before;
+    let separate = accepted_v4() - before;
     assert_eq!(
         separate, BURST as u64,
         "control failed: plain Initials were refused, so this test cannot \
@@ -1267,7 +1263,7 @@ async fn a_coalesced_burst_of_initials_is_still_accepted() {
 
     // The finding: the same Initials in one GSO write, which the kernel
     // coalesces into a single RecvMeta on the way in.
-    let before = accepted_v3();
+    let before = accepted_v4();
     let mut blob = Vec::new();
     for _ in 0..BURST {
         blob.extend_from_slice(&build());
@@ -1286,7 +1282,7 @@ async fn a_coalesced_burst_of_initials_is_still_accepted() {
         )
         .unwrap();
     tokio::time::sleep(Duration::from_millis(300)).await;
-    let coalesced = accepted_v3() - before;
+    let coalesced = accepted_v4() - before;
 
     assert_eq!(
         coalesced, BURST as u64,
