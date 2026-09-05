@@ -21,6 +21,7 @@
 use clap::Parser;
 use squic::{self, Config};
 use std::net::SocketAddr;
+use std::time::Duration;
 
 #[derive(Parser)]
 struct Args {
@@ -139,7 +140,16 @@ async fn run_client(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let (mut send, mut recv) = conn.open_bi().await?;
     send.write_all(b"hi").await?;
     send.finish()?;
+    // The reply is an acknowledgement, not a result: everything the harness
+    // reads from this process is already on stdout, and everything it reads
+    // from the server was printed during the handshake. So bound the wait. An
+    // unbounded read costs `max_idle_timeout` — 30 seconds — against any peer
+    // that exits without flushing its reply, which is a probe that has already
+    // succeeded sitting silent for half a minute.
     let mut buf = [0u8; 8];
-    let _ = recv.read(&mut buf).await;
+    let _ = tokio::time::timeout(Duration::from_secs(2), recv.read(&mut buf)).await;
+    // Say we are done rather than letting the connection idle out, so the peer
+    // learns of the close now instead of on its own timeout.
+    conn.close(0u32.into(), b"done");
     Ok(())
 }

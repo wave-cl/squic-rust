@@ -1335,3 +1335,85 @@ async fn dial_refuses_an_envelope_version_this_build_cannot_emit() {
         "the implemented version was refused by the guard: {err}"
     );
 }
+
+/// The mirror of the guard above, and the one with the higher price for being
+/// absent. A server told to accept only versions it cannot parse binds, reports
+/// itself healthy, and then drops every Initial without a word — SIP-6 requires
+/// the silence, so nothing distinguishes it from a firewall.
+///
+/// `[3]` is the case that matters rather than a synthetic one: it is what `ex`
+/// had in its config file up to the v4 cut, and installing a v4 binary without
+/// editing that line would have taken the exchange down in silence.
+#[tokio::test]
+async fn listen_refuses_an_accept_set_this_build_cannot_parse() {
+    let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let (signing_key, _pk) = squic::generate_keypair();
+
+    // Wholly unparsable, including ex's real pre-cut config.
+    for bad in [vec![3u8], vec![1], vec![0], vec![2, 3], vec![5, 255]] {
+        let err = squic::listen(
+            addr,
+            &signing_key,
+            Config {
+                accepted_envelope_versions: bad.clone(),
+                ..Default::default()
+            },
+        )
+        .await;
+        let Err(err) = err else {
+            panic!("listen bound on an accept set it cannot parse: {bad:?}");
+        };
+        assert!(
+            err.to_string().contains("accepted_envelope_versions"),
+            "{bad:?} was refused for the wrong reason: {err}"
+        );
+    }
+
+    // The quieter half: a set mixing parsable and unparsable versions. This one
+    // would serve v4 callers and silently drop v3 callers while the operator
+    // believed both were served, so it is refused too.
+    let err = squic::listen(
+        addr,
+        &signing_key,
+        Config {
+            accepted_envelope_versions: vec![3, 4],
+            ..Default::default()
+        },
+    )
+    .await;
+    let Err(err) = err else {
+        panic!("listen bound on a partly-unparsable accept set");
+    };
+    assert!(err.to_string().contains("accepted_envelope_versions"), "{err}");
+
+    // And empty, which names nothing unparsable and yet accepts nothing.
+    let err = squic::listen(
+        addr,
+        &signing_key,
+        Config {
+            accepted_envelope_versions: vec![],
+            ..Default::default()
+        },
+    )
+    .await;
+    let Err(err) = err else {
+        panic!("listen bound on an empty accept set");
+    };
+    assert!(err.to_string().contains("empty"), "{err}");
+
+    // The control. The implemented set gets past the guard and binds, so the
+    // test above is failing on the version and not on something incidental to
+    // every listen in it.
+    let ok = squic::listen(
+        addr,
+        &signing_key,
+        Config {
+            accepted_envelope_versions: vec![squic::mac::ENVELOPE_V4],
+            ..Default::default()
+        },
+    )
+    .await;
+    if let Err(e) = ok {
+        panic!("the implemented version was refused by the guard: {e}");
+    }
+}

@@ -412,6 +412,45 @@ pub async fn listen(
     signing_key: &SigningKey,
     config: Config,
 ) -> Result<ServerListener, Error> {
+    // The mirror of the guard in `dial`, and the one that costs more to be
+    // without. A server told to accept a version this build cannot parse does
+    // not fail: it binds, it logs that it is listening, systemd calls it
+    // healthy — and it drops every Initial that arrives, in silence, because
+    // SIP-6 requires exactly that of anything it cannot validate. The operator
+    // sees a live process and a dead port with no line anywhere saying why.
+    //
+    // This is not hypothetical. `ex` ran `accepted_envelope_versions = [3]`
+    // right up to the v4 cut, and installing the binary without editing that
+    // line in the same breath would have taken the exchange down without a
+    // single error. Refuse at listen instead, where the operator is looking.
+    //
+    // Every named version must be implemented, not merely one of them. A set
+    // like [3, 4] on a v4-only build is the quieter half of the same fault:
+    // v4 callers connect, v3 callers are dropped without a word, and the
+    // operator believes both are served. Listing a version this build cannot
+    // parse is a statement the server has no way to honour, so it is refused
+    // whatever else is in the list. That does mean a config naming a version
+    // ahead of the binary is rejected — which is correct: the accept set is
+    // read at start, and a version arrives with the code that parses it.
+    if config.accepted_envelope_versions.is_empty() {
+        return Err(Error::Tls(
+            "accepted_envelope_versions is empty; a server that accepts no envelope version              binds successfully and then drops every Initial in silence"
+                .into(),
+        ));
+    }
+    let unparsable: Vec<u8> = config
+        .accepted_envelope_versions
+        .iter()
+        .copied()
+        .filter(|v| crate::mac::trailer_len(crate::mac::hdr(*v, false)).is_none())
+        .collect();
+    if !unparsable.is_empty() {
+        return Err(Error::Tls(format!(
+            "accepted_envelope_versions names {unparsable:?}, which this build cannot parse              (it implements {:?}); a server accepting only versions it cannot parse binds              successfully and then drops every Initial in silence",
+            crate::mac::ENVELOPE_VERSIONS
+        )));
+    }
+
     let server_x25519_priv = ed25519_private_to_x25519(signing_key);
     let whitelist = Arc::new(Whitelist::new(
         config.allowed_keys.as_deref(),
