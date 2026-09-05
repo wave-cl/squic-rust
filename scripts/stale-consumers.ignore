@@ -1,0 +1,11 @@
+# Repositories this scan should not fail on, one per line, with the reason.
+#
+# Ignored entries are still printed. A check that hides things is a check
+# nobody reads, and the point of this file is only to stop a permanently red
+# result from training everyone to skip the output.
+#
+# Do not add a repository here because fixing it is inconvenient. Add it when
+# being stale is *correct* — the thing is retired, or it is deliberately pinned
+# to an old envelope for a reason that is written down.
+
+sqns   retired 2026-08-31 with the ns server; no longer deployed anywhere

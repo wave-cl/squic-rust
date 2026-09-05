@@ -1,0 +1,141 @@
+#!/usr/bin/env bash
+# Which repositories in this estate are pinned to a squic that cannot talk to
+# the current one?
+#
+# Run it after cutting an envelope version, and before believing the cut is
+# done. It exists because it was needed and did not exist: sigil sat on squic
+# v0.18.0 — emitting envelope version 2 — for the whole of the version 4 cut,
+# and nothing said so. Its CI was green throughout and structurally could not
+# have caught it, because sigil compiles against its pins and its tests stand up
+# an equally stale in-process server, which is therefore equally happy. On the
+# wire the failure is silent by design: a refused envelope draws no reply, so it
+# looks exactly like an unreachable host.
+#
+#   scripts/stale-consumers            # scan the sibling repositories
+#   scripts/stale-consumers --quiet    # print only problems
+#   scripts/stale-consumers <dir>      # scan somewhere else
+#
+# Exit status is 1 if anything is stranded.
+#
+# This is a local tool, not a CI job, and the reason is worth stating: it works
+# by reading the *sibling* checkouts on a developer's disk. A CI runner has one
+# repository and no siblings, so there is nothing there for it to scan. Wiring
+# it into CI would produce a green tick over an empty scan — which is the exact
+# failure this estate has already been bitten by, a check that passes because it
+# checked nothing. Run it by hand after cutting a version.
+#
+# ## What it reads, and why the lockfile
+#
+# Cargo.lock, not Cargo.toml. The manifest shows what a repository asked for;
+# the lock shows what it got, and the gap between those is where this estate has
+# actually been bitten. sqex pinned sqnr, sqnr pinned an older squic, and sqex's
+# tree ended up carrying *two* squic versions — with the sqnr client path, which
+# dials, on the retired one. A manifest scan sees a current squic and reports
+# nothing. That happened twice in one day.
+#
+# ## How it decides
+#
+# Nothing here is a hardcoded compatibility table. For each squic version found
+# in a lock, the emitted envelope version is read out of that version's own tag
+# (`git show vX.Y.Z:src/lib.rs`), and the accepted set is read out of this
+# working tree. A version whose emitted envelope is not in the current accepted
+# set cannot complete a handshake — that is the definition of stranded, and it
+# comes from the source rather than from anyone's memory of it.
+#
+# Being merely *behind* is not a fault and is reported separately. Envelope
+# compatibility is the question that matters; patch drift is not.
+set -u
+
+SQUIC_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+SCAN_DIR="${1:-$(cd "$SQUIC_DIR/.." && pwd)}"
+[ "${1:-}" = "--quiet" ] && { QUIET=1; SCAN_DIR="$(cd "$SQUIC_DIR/.." && pwd)"; } || QUIET=0
+
+# The envelope version a given squic tag emits by default, or empty if the tag
+# is not one we have.
+emitted_by() {
+    git -C "$SQUIC_DIR" show "v$1:src/lib.rs" 2>/dev/null |
+        sed -n 's/.*envelope_version: crate::mac::ENVELOPE_V\([0-9]*\),.*/\1/p' | head -1
+}
+
+# What this working tree will accept. Read once.
+accepted=$(sed -n 's/.*accepted_envelope_versions: vec!\[\(.*\)\],/\1/p' "$SQUIC_DIR/src/lib.rs" |
+    head -1 | grep -o 'ENVELOPE_V[0-9]*' | sed 's/ENVELOPE_V//' | tr '\n' ' ')
+current=$(sed -n 's/^version = "\(.*\)"/\1/p' "$SQUIC_DIR/Cargo.toml" | head -1)
+
+if [ -z "$accepted" ]; then
+    echo "cannot read accepted_envelope_versions from $SQUIC_DIR/src/lib.rs" >&2
+    exit 2
+fi
+
+echo "squic $current in $SQUIC_DIR accepts envelope version(s): $accepted"
+echo "scanning $SCAN_DIR"
+echo
+
+# Repositories that are allowed to be stale, and why. Still printed.
+IGNORE_FILE="$SQUIC_DIR/scripts/stale-consumers.ignore"
+ignored_reason() {
+    [ -f "$IGNORE_FILE" ] || return 1
+    sed 's/#.*//' "$IGNORE_FILE" | awk -v r="$1" '$1==r { $1=""; sub(/^ +/,""); print; found=1 } END { exit !found }'
+}
+
+stranded=0 behind=0 checked=0 ignored=0
+
+for lock in "$SCAN_DIR"/*/Cargo.lock; do
+    [ -f "$lock" ] || continue
+    repo="$(basename "$(dirname "$lock")")"
+    [ "$(dirname "$lock")" = "$SQUIC_DIR" ] && continue
+
+    # Every squic version this lock resolves, direct or transitive. awk rather
+    # than grep -A because a package block's fields are not at fixed offsets.
+    versions=$(awk '
+        /^\[\[package\]\]/ { name=""; ver="" }
+        /^name = "squic"$/ { name="squic" }
+        /^version = / && name=="squic" { gsub(/[",]/,"",$3); print $3; name="" }
+    ' "$lock" | sort -u)
+    [ -n "$versions" ] || continue
+    checked=$((checked+1))
+
+    for v in $versions; do
+        emits=$(emitted_by "$v")
+        if [ -z "$emits" ]; then
+            # No such tag. A path dependency resolves to the working tree, which
+            # is this checkout — current by construction.
+            if grep -q "name = \"squic\"" "$lock" && ! grep -q "squic-rust?tag=v$v" "$lock"; then
+                [ "$QUIET" = 1 ] || printf '  %-14s squic %-8s path dep — tracks this checkout\n' "$repo" "$v"
+            else
+                printf '  %-14s squic %-8s UNKNOWN: no tag v%s in %s\n' "$repo" "$v" "$v" "$SQUIC_DIR"
+            fi
+            continue
+        fi
+
+        if ! echo " $accepted " | grep -q " $emits "; then
+            if reason=$(ignored_reason "$repo"); then
+                printf '  %-14s squic %-8s stale (envelope v%s) — ignored: %s\n' \
+                    "$repo" "$v" "$emits" "$reason"
+                ignored=$((ignored+1))
+                continue
+            fi
+            printf '  %-14s squic %-8s STRANDED: emits envelope v%s, current accepts %s\n' \
+                "$repo" "$v" "$emits" "$accepted"
+            stranded=$((stranded+1))
+        elif [ "$v" != "$current" ]; then
+            behind=$((behind+1))
+            [ "$QUIET" = 1 ] || printf '  %-14s squic %-8s behind (envelope v%s, still accepted)\n' "$repo" "$v" "$emits"
+        else
+            [ "$QUIET" = 1 ] || printf '  %-14s squic %-8s current\n' "$repo" "$v"
+        fi
+    done
+done
+
+echo
+echo "=== $checked repositories with a squic in their lock · $stranded stranded · $behind behind · $ignored ignored ==="
+if [ "$stranded" -gt 0 ]; then
+    cat <<'NOTE'
+
+A stranded consumer cannot complete a handshake and will not be told why. Bump
+its squic pin — and if it pins another crate that pins squic, bump that too, or
+the lock keeps both and the older one is the copy that dials.
+NOTE
+    exit 1
+fi
+exit 0
