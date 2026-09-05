@@ -447,19 +447,23 @@ async fn test_initial_packet_arrives_fast() {
     let _ = server_task.await;
 }
 
-/// Verify MAC_OVERHEAD is the expected 108 bytes at runtime (SIP-3 added the
-/// 32-byte Ed25519 identity field).
+/// The trailer widths, at runtime as well as at compile time. An anonymous
+/// caller pays 69 bytes; carrying an identity costs the 32 that version 3 spent
+/// on every Initial whether there was one or not.
 #[test]
-fn test_mac_overhead_is_108() {
-    assert_eq!(squic::mac::MAC_OVERHEAD, 108);
+fn trailer_widths_are_69_and_101() {
+    assert_eq!(squic::mac::TRAILER_ANON, 69);
     assert_eq!(
-        squic::mac::MAC_OVERHEAD,
+        squic::mac::TRAILER_ANON,
         squic::mac::CLIENT_KEY_SIZE
-            + squic::mac::ED25519_SIZE
             + squic::mac::TIMESTAMP_SIZE
-            + squic::mac::NONCE_SIZE
+            + squic::mac::GATE_SIZE
             + squic::mac::MAC_SIZE
-            + squic::mac::MAC2_SIZE,
+            + squic::mac::HDR_SIZE,
+    );
+    assert_eq!(
+        squic::mac::TRAILER_WITH_IDENTITY,
+        squic::mac::TRAILER_ANON + squic::mac::ED25519_SIZE
     );
 }
 
@@ -915,12 +919,23 @@ async fn test_peer_key_none_for_unknown_dcid() {
     assert!(seen.is_some(), "an ephemeral client still has a verified transport key");
 }
 
+/// The gate key a caller derives from the server's *published* Ed25519 key.
+///
+/// The forgeries below use the real one deliberately. The gate proves only that
+/// a caller holds a public value, so an attacker has it too — and every check
+/// these tests exercise has to stand on its own, without the gate turning the
+/// attacker away first and making the test pass for the wrong reason.
+fn server_gate_key(server_ed_pub: &[u8; 32]) -> [u8; 32] {
+    let x = squic::crypto::ed25519_public_to_x25519(server_ed_pub).expect("server key maps");
+    squic::mac::gate_key(x.as_bytes())
+}
+
 /// Build one Initial envelope by hand, the way a client would.
 /// Returns the datagram ready to put on the wire.
 fn forge_initial(
     shared: &[u8; 32],
     client_x25519_pub: &[u8; 32],
-    mac2: [u8; 16],
+    gate_key: &[u8],
 ) -> Vec<u8> {
     let datagram = {
         let mut d = vec![0u8; 1200];
@@ -933,18 +948,20 @@ fn forge_initial(
         d[5] = 8; // DCID length
         d
     };
-    let ed = [0u8; 32]; // no identity asserted
     let ts = squic::mac::now_timestamp();
-    let nonce = squic::mac::generate_nonce();
-    let mac1 = squic::mac::compute_mac1(squic::mac::ENVELOPE_V1, shared, &datagram, &ed, ts, &nonce);
+    let h = squic::mac::hdr(squic::mac::ENVELOPE_V4, false);
 
     let mut buf = datagram;
     buf.extend_from_slice(client_x25519_pub);
-    buf.extend_from_slice(&ed);
     buf.extend_from_slice(&ts.to_be_bytes());
-    buf.extend_from_slice(&nonce);
+    // The forgery holds the server's public key — it is published — so the gate
+    // is no obstacle to it. That is deliberate: the check this fixture exists to
+    // exercise is the non-contributory one, and it must stand on its own.
+    let gate = squic::mac::compute_gate(h, gate_key, &buf);
+    let mac1 = squic::mac::compute_mac1(h, shared, &buf);
+    buf.extend_from_slice(&gate);
     buf.extend_from_slice(&mac1);
-    buf.extend_from_slice(&mac2);
+    buf.push(h);
     buf
 }
 
@@ -955,14 +972,14 @@ fn forge_initial(
 /// no whitelist.
 #[tokio::test]
 async fn test_small_order_client_key_is_refused() {
-    let (listener, _sk, _pk) = start_server(Config::default()).await;
+    let (listener, _sk, pk) = start_server(Config::default()).await;
     let server_addr = listener.local_addr().unwrap();
 
     // The attacker knows nothing about the server, and assumes the shared
     // secret will be zeros — which it will be, if the check is missing.
     let assumed_shared = [0u8; 32];
     let small_order_key = [0u8; 32];
-    let buf = forge_initial(&assumed_shared, &small_order_key, [0u8; 16]);
+    let buf = forge_initial(&assumed_shared, &small_order_key, &server_gate_key(&pk));
 
     let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     sock.send_to(&buf, server_addr).await.unwrap();
@@ -983,7 +1000,7 @@ async fn test_whitelist_does_not_substitute_for_mac1() {
     let victim_x = squic::crypto::ed25519_public_to_x25519(&victim_ed).unwrap();
     let victim_key = victim_x.to_bytes();
 
-    let (listener, _sk, _pk) = start_server(Config {
+    let (listener, _sk, pk) = start_server(Config {
         allowed_keys: Some(vec![victim_key]),
         ..Default::default()
     })
@@ -994,7 +1011,7 @@ async fn test_whitelist_does_not_substitute_for_mac1() {
     // the shared secret it belongs to.
     let mut wrong_shared = [0u8; 32];
     wrong_shared[0] = 0x5A;
-    let buf = forge_initial(&wrong_shared, &victim_key, [0u8; 16]);
+    let buf = forge_initial(&wrong_shared, &victim_key, &server_gate_key(&pk));
 
     let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     sock.send_to(&buf, server_addr).await.unwrap();
@@ -1012,7 +1029,7 @@ async fn test_whitelist_does_not_substitute_for_mac1() {
 /// the answer half.
 #[tokio::test]
 async fn test_zero_mac2_under_load_draws_a_challenge() {
-    let (listener, signing_key, _pk) = start_server(Config::default()).await;
+    let (listener, signing_key, pk) = start_server(Config::default()).await;
     let server_addr = listener.local_addr().unwrap();
     listener.set_under_load(true);
 
@@ -1024,7 +1041,7 @@ async fn test_zero_mac2_under_load_draws_a_challenge() {
         squic::crypto::ed25519_public_to_x25519(&signing_key.verifying_key().to_bytes()).unwrap();
     let shared = squic::crypto::x25519(&client_x_priv, &server_x_pub).unwrap();
 
-    let buf = forge_initial(&shared, &client_x_pub, [0u8; 16]);
+    let buf = forge_initial(&shared, &client_x_pub, &server_gate_key(&pk));
 
     let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     sock.send_to(&buf, server_addr).await.unwrap();
@@ -1062,7 +1079,7 @@ async fn test_zero_mac2_under_load_draws_a_challenge() {
 /// case never converges.
 #[tokio::test]
 async fn test_cookie_secret_rotation_keeps_one_generation_of_grace() {
-    let (listener, signing_key, _pk) = start_server(Config::default()).await;
+    let (listener, signing_key, pk) = start_server(Config::default()).await;
     let server_addr = listener.local_addr().unwrap();
     listener.set_under_load(true);
 
@@ -1077,7 +1094,7 @@ async fn test_cookie_secret_rotation_keeps_one_generation_of_grace() {
     let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
     // Draw a challenge and keep the cookie.
-    sock.send_to(&forge_initial(&shared, &client_x_pub, [0u8; 16]), server_addr)
+    sock.send_to(&forge_initial(&shared, &client_x_pub, &server_gate_key(&pk)), server_addr)
         .await
         .unwrap();
     let mut reply = [0u8; 128];
@@ -1129,13 +1146,9 @@ async fn send_with_cookie(
     client_pub: &[u8; 32],
     cookie: &[u8; 16],
 ) {
-    // Build the envelope, then compute MAC2 over it up to but not including
-    // MAC1 — the boundary SIP-7 specifies.
-    let mut buf = forge_initial(shared, client_pub, [0u8; 16]);
-    let len = buf.len();
-    let mac1: [u8; 16] = buf[len - 32..len - 16].try_into().unwrap();
-    let mac2 = squic::mac::compute_mac2(cookie, &buf[..len - 32], &mac1);
-    buf[len - 16..].copy_from_slice(&mac2);
+    // The same envelope, with the cookie as the gate key instead of the one
+    // derived from the server's public key. One field, two modes.
+    let buf = forge_initial(shared, client_pub, cookie);
     sock.send_to(&buf, to).await.unwrap();
 }
 
@@ -1150,26 +1163,18 @@ async fn wait_for_mac2(listener: &squic::ServerListener, want: u64) -> u64 {
     listener.load_stats().mac2_verified
 }
 
-/// SIP-29's Sending rule in two parts. A release that *introduces* a version
-/// ships clients still sending the previous one, so upgrading a client before a
-/// server cannot break anything; a later release moves the default once servers
-/// have deployed. This is that later release, so the default is version 2 — and
-/// a server still accepts version 1, because retiring it is a separate decision
-/// a deployment makes for itself.
+/// One version, and the default accept-set is that same version.
+///
+/// The second audit measured why this matters: with `[1, 2, 3]` as the shipped
+/// default, a junk datagram bought a curve operation, because versions 1 and 2
+/// carried no cheap gate for the server to check. A default that admits a
+/// weaker envelope than the client sends undoes the gate entirely.
 #[test]
-fn the_client_default_is_version_3_and_servers_still_accept_the_older_ones() {
+fn the_only_version_is_four_and_it_is_the_default_on_both_sides() {
     let config = Config::default();
-    assert_eq!(config.envelope_version, squic::mac::ENVELOPE_V3);
-    // A server upgraded to this release still serves the clients that have not
-    // moved. Retiring the older versions is a deployment's own decision, and
-    // the thing that finally makes the cookie stage silent (SIP-37).
-    for v in [
-        squic::mac::ENVELOPE_V1,
-        squic::mac::ENVELOPE_V2,
-        squic::mac::ENVELOPE_V3,
-    ] {
-        assert!(config.accepted_envelope_versions.contains(&v));
-    }
+    assert_eq!(config.envelope_version, squic::mac::ENVELOPE_V4);
+    assert_eq!(config.accepted_envelope_versions, vec![squic::mac::ENVELOPE_V4]);
+    assert_eq!(squic::mac::ENVELOPE_VERSIONS, [squic::mac::ENVELOPE_V4]);
 }
 
 /// S9: a coalesced burst of Initials must still be accepted.

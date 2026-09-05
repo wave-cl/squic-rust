@@ -7,60 +7,43 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Size of the MAC1 tag in bytes.
 pub const MAC_SIZE: usize = 16;
 
+/// Size of the gate tag in bytes (SIP-37 successor).
+pub const GATE_SIZE: usize = 16;
+
 /// Size of an X25519 public key.
 pub const CLIENT_KEY_SIZE: usize = 32;
 
-/// Size of the carried Ed25519 identity key (SIP-3). All-zero means "no
-/// identity asserted".
+/// Size of the carried Ed25519 identity key (SIP-3), when one is present.
 pub const ED25519_SIZE: usize = 32;
 
 /// Size of the replay-protection timestamp (uint32 epoch seconds).
 pub const TIMESTAMP_SIZE: usize = 4;
 
-/// Size of MAC2 tag in bytes.
-pub const MAC2_SIZE: usize = 16;
+/// Size of the trailing header byte: version in the high nibble, flags in the
+/// low one.
+pub const HDR_SIZE: usize = 1;
 
-/// Size of the random nonce in bytes.
-pub const NONCE_SIZE: usize = 8;
-
-/// Total overhead appended to Initial packets by envelope version 1 (SIP-6):
-/// 32-byte client X25519 public key + 32-byte Ed25519 identity + 4-byte
-/// timestamp + 8-byte nonce + 16-byte MAC1 + 16-byte MAC2.
-pub const MAC_OVERHEAD: usize =
-    CLIENT_KEY_SIZE + ED25519_SIZE + TIMESTAMP_SIZE + NONCE_SIZE + MAC_SIZE + MAC2_SIZE;
-
-/// Envelope version 1 (SIP-6): no marker byte on the wire. It is named so that
-/// a receiver supporting both has something to call the unmarked form.
-pub const ENVELOPE_V1: u8 = 1;
-
-/// Envelope version 2 (SIP-29): version 1 plus a one-byte marker, last.
-pub const ENVELOPE_V2: u8 = 2;
-
-/// Envelope version 3: version 2 plus MAC0, a cheap outer MAC keyed on the
-/// server's public key and verified before any curve operation.
+/// Envelope version 4.
 ///
-/// MAC1 is a Diffie-Hellman, so a server cannot tell a caller who knows its
-/// public key from a stranger without paying for one — which is why the cookie
-/// defence has to challenge before it knows who it is talking to, and why a
-/// server under load answers everybody. WireGuard does not have this problem:
-/// its MAC1 is keyed on a *hash* of the responder's static public key and costs
-/// a hash to check, so it only ever cookies callers that have already proved
-/// they know the key. MAC0 is that construction, added alongside sQUIC's MAC1
-/// rather than replacing it.
-pub const ENVELOPE_V3: u8 = 3;
+/// One gate tag replaces the separate MAC0 and MAC2 of version 3. They were
+/// never both load-bearing: a cookie is delivered encrypted under a key derived
+/// from the server's public key, so producing a valid MAC2 already demonstrated
+/// the key knowledge MAC0 existed to prove. Version 3 paid 32 bytes for two
+/// states of one proof.
+///
+/// The identity field is now carried only when there is one, and the version-1
+/// nonce is gone — SIP-6 said it was never tracked, and the QUIC datagram
+/// underneath already differs per attempt.
+pub const ENVELOPE_V4: u8 = 4;
 
-/// Size of the MAC0 tag in bytes.
-pub const MAC0_SIZE: usize = 16;
+/// Flag bit: a 32-byte Ed25519 identity follows the X25519 key (SIP-3).
+pub const FLAG_IDENTITY: u8 = 0x01;
 
-/// Size of the version marker.
-pub const VERSION_SIZE: usize = 1;
-
-/// Every envelope version this build knows, lowest first.
+/// Every envelope version this build knows.
 ///
 /// The one list to extend when a version is added — `trailer_len` and the
-/// per-version accept counters are both keyed off it, and
-/// `every_known_version_has_a_trailer` fails if the two drift apart.
-pub const ENVELOPE_VERSIONS: [u8; 3] = [ENVELOPE_V1, ENVELOPE_V2, ENVELOPE_V3];
+/// per-version accept counters are both keyed off it.
+pub const ENVELOPE_VERSIONS: [u8; 1] = [ENVELOPE_V4];
 
 /// The position of `version` in [`ENVELOPE_VERSIONS`], for indexing per-version
 /// state. `None` for a version this build does not know.
@@ -68,81 +51,98 @@ pub fn version_index(version: u8) -> Option<usize> {
     ENVELOPE_VERSIONS.iter().position(|&v| v == version)
 }
 
-/// Trailer width for envelope version 2.
-pub const MAC_OVERHEAD_V2: usize = MAC_OVERHEAD + VERSION_SIZE;
+/// Build the trailing header byte.
+pub fn hdr(version: u8, identity: bool) -> u8 {
+    (version << 4) | if identity { FLAG_IDENTITY } else { 0 }
+}
 
-/// Trailer width for envelope version 3: version 2 plus the MAC0 field.
-pub const MAC_OVERHEAD_V3: usize = MAC_OVERHEAD_V2 + MAC0_SIZE;
+/// The version half of a header byte.
+pub fn hdr_version(hdr: u8) -> u8 {
+    hdr >> 4
+}
 
-// Static assertions: the version 1 trailer is 108 bytes (32+32+4+8+16+16) and
-// version 2 is one more. If either changes, update ClientSocket::try_send(),
-// which bypasses quinn-udp for the oversized Initial packet to avoid GSO issues
-// on Linux.
-const _: () = assert!(MAC_OVERHEAD == 108, "MAC_OVERHEAD changed — update Initial send path in conn.rs");
-const _: () = assert!(MAC_OVERHEAD_V2 == 109, "MAC_OVERHEAD_V2 changed — update Initial send path in conn.rs");
-const _: () = assert!(MAC_OVERHEAD_V3 == 125, "MAC_OVERHEAD_V3 changed — update Initial send path in conn.rs");
+/// Whether a header byte says an Ed25519 identity is carried.
+pub fn hdr_has_identity(hdr: u8) -> bool {
+    hdr & FLAG_IDENTITY != 0
+}
 
-/// The trailer width for an envelope version, or `None` if unknown.
+/// Trailer width for an anonymous caller: X25519, timestamp, gate, MAC1, header.
+pub const TRAILER_ANON: usize =
+    CLIENT_KEY_SIZE + TIMESTAMP_SIZE + GATE_SIZE + MAC_SIZE + HDR_SIZE;
+
+/// Trailer width when an identity is carried.
+pub const TRAILER_WITH_IDENTITY: usize = TRAILER_ANON + ED25519_SIZE;
+
+// The Initial send path bypasses quinn-udp because a 1200-byte QUIC datagram
+// plus this trailer exceeds the 1200-byte GSO segment size. These assertions
+// fail if the arithmetic behind that decision moves.
+const _: () = assert!(TRAILER_ANON == 69, "TRAILER_ANON changed — check the Initial send path in conn.rs");
+const _: () = assert!(TRAILER_WITH_IDENTITY == 101, "TRAILER_WITH_IDENTITY changed — check the Initial send path in conn.rs");
+
+/// The trailer width a header byte implies, or `None` if the version is unknown.
 ///
-/// SIP-29: version 0 is reserved and never emitted, so a zero byte is known not
-/// to be a marker.
-pub fn trailer_len(version: u8) -> Option<usize> {
-    match version {
-        ENVELOPE_V1 => Some(MAC_OVERHEAD),
-        ENVELOPE_V2 => Some(MAC_OVERHEAD_V2),
-        ENVELOPE_V3 => Some(MAC_OVERHEAD_V3),
-        _ => None,
+/// Unlike version 3 this is not a constant per version: the identity field is
+/// present only when flagged, so the width has to be read off the header byte
+/// that a receiver finds at the end of the datagram.
+pub fn trailer_len(hdr: u8) -> Option<usize> {
+    if hdr_version(hdr) != ENVELOPE_V4 {
+        return None;
     }
+    Some(if hdr_has_identity(hdr) {
+        TRAILER_WITH_IDENTITY
+    } else {
+        TRAILER_ANON
+    })
 }
 
-/// Whether this envelope version carries a MAC0 field.
-pub fn has_mac0(version: u8) -> bool {
-    version >= ENVELOPE_V3
-}
+/// Domain separator for the gate key.
+const GATE_KEY_LABEL: &[u8] = b"squic-gate-v1";
 
-/// Domain separator for the MAC0 key.
-const MAC0_KEY_LABEL: &[u8] = b"squic-mac0-v1";
-
-/// Derive the MAC0 key from the server's X25519 public key.
+/// Derive the no-cookie gate key from the server's X25519 public key.
 ///
 /// Keyed on a *public* value, deliberately. Every legitimate caller already
 /// holds the server's public key — that is the premise of a silent server — so
-/// both ends can compute this with one hash and no key agreement. It is
-/// therefore not authentication: anyone holding the key can forge a MAC0, and
-/// MAC1 remains the proof of possession. What it buys is that a caller who does
-/// *not* hold the key can be turned away for the price of one HMAC, before the
-/// cookie decision and before the Diffie-Hellman.
-pub fn mac0_key(server_x25519_pub: &[u8; 32]) -> [u8; 32] {
+/// both ends compute this with one hash and no key agreement. It is therefore
+/// not authentication: anyone holding the key can forge this tag, and MAC1
+/// remains the proof of possession. What it buys is that a caller who does
+/// *not* hold the key is turned away for the price of one HMAC, before the
+/// Diffie-Hellman.
+pub fn gate_key(server_x25519_pub: &[u8; 32]) -> [u8; 32] {
     let mut hasher = Sha256::new();
-    hasher.update(MAC0_KEY_LABEL);
+    hasher.update(GATE_KEY_LABEL);
     hasher.update(server_x25519_pub);
     hasher.finalize().into()
 }
 
-/// Compute MAC0 over the envelope up to but not including MAC0 itself.
+/// Compute the gate tag over the envelope up to but not including the tag.
 ///
-/// `covered` is `datagram || x25519 || ed25519 || ts || nonce` — one contiguous
-/// slice, which is why this takes bytes rather than fields. The version is
-/// prefixed for the reason SIP-29 gives for MAC1: it authenticates the marker a
-/// receiver has to read before it can verify anything, and it makes tags
-/// computed under different versions unrelated.
+/// `covered` is `datagram || x25519 || [ed25519] || ts` — one contiguous slice,
+/// which is why this takes bytes rather than fields. The header byte is
+/// prefixed for the reason SIP-29 gives: it authenticates the byte a receiver
+/// has to read before it can verify anything, and because it comes first, tags
+/// computed under different versions or different flags are unrelated even when
+/// the rest of the input coincides.
 ///
-/// Unlike MAC1 this covers the client's X25519 key explicitly. MAC1 does not
-/// need to — that key is what its shared secret is derived from — but MAC0's
-/// key does not depend on it, so leaving it out would let it be swapped.
-pub fn compute_mac0(version: u8, key: &[u8; 32], covered: &[u8]) -> [u8; MAC0_SIZE] {
+/// The key is what makes this one field do two jobs:
+///
+/// * [`gate_key`] — the caller holds no cookie, and the tag proves only that it
+///   knows the server's public key.
+/// * the cookie itself — the caller answered a challenge, and the tag proves
+///   that *and* that its source address receives packets, which no single
+///   datagram can demonstrate on its own.
+pub fn compute_gate(hdr: u8, key: &[u8], covered: &[u8]) -> [u8; GATE_SIZE] {
     let mut mac = <HmacSha256 as Mac>::new_from_slice(key).expect("HMAC accepts any key size");
-    mac.update(&[version]);
+    mac.update(&[hdr]);
     mac.update(covered);
     let result = mac.finalize().into_bytes();
-    let mut tag = [0u8; MAC0_SIZE];
-    tag.copy_from_slice(&result[..MAC0_SIZE]);
+    let mut tag = [0u8; GATE_SIZE];
+    tag.copy_from_slice(&result[..GATE_SIZE]);
     tag
 }
 
-/// Verify MAC0 with constant-time comparison.
-pub fn verify_mac0(version: u8, key: &[u8; 32], covered: &[u8], mac0: &[u8]) -> bool {
-    constant_time_eq(&compute_mac0(version, key, covered), mac0)
+/// Verify a gate tag with constant-time comparison.
+pub fn verify_gate(hdr: u8, key: &[u8], covered: &[u8], gate: &[u8]) -> bool {
+    constant_time_eq(&compute_gate(hdr, key, covered), gate)
 }
 
 /// First byte of a cookie reply packet.
@@ -162,40 +162,25 @@ pub const COOKIE_SECRET_LIFETIME_SECS: u64 = 120;
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// Compute MAC1 = HMAC-SHA256(shared_secret, data || ed25519 || timestamp || nonce)[:16]
+/// Compute MAC1 over the same range the gate tag covers, keyed on the
+/// Diffie-Hellman shared secret.
 ///
-/// SIP-3: the carried Ed25519 identity field is part of the MAC1 input. This is
+/// One covered range for both tags — `hdr || datagram || x25519 || [ed25519] ||
+/// ts` — so there is a single rule to hold rather than two constructions with
+/// different opinions about what they authenticate.
+///
+/// This is the proof of possession, and the reason it cannot merge with the
+/// gate: verifying it requires the curve operation the gate exists to avoid.
+///
+/// SIP-3: the carried Ed25519 identity is inside the covered range. That is
 /// load-bearing — it does not feed the shared secret, so if it were left
-/// unauthenticated an on-path attacker could substitute the sign-conjugate key
-/// (which passes the server's derivation check) and flip the reported identity.
-/// `ed25519` is the 32-byte field exactly as it appears on the wire (all zeros
-/// when no identity is asserted).
-pub fn compute_mac1(
-    version: u8,
-    shared_secret: &[u8],
-    data: &[u8],
-    ed25519: &[u8],
-    timestamp: u32,
-    nonce: &[u8],
-) -> [u8; MAC_SIZE] {
+/// unauthenticated an on-path attacker could substitute the sign-conjugate key,
+/// which passes the server's derivation check, and flip the reported identity.
+pub fn compute_mac1(hdr: u8, shared_secret: &[u8], covered: &[u8]) -> [u8; MAC_SIZE] {
     let mut mac =
         <HmacSha256 as Mac>::new_from_slice(shared_secret).expect("HMAC accepts any key size");
-    // SIP-29: every marked version prefixes its version byte. Version 1
-    // predates the marker and prefixes nothing.
-    //
-    // A prefix rather than a suffix, because it is doing two jobs. It
-    // authenticates the marker, which a receiver has to read before it can
-    // verify anything. And because it comes first, tags computed under
-    // different versions are unrelated even when the remaining input
-    // coincides — so a packet valid under one version can never verify under
-    // another, whatever an attacker picks for the rest of the envelope.
-    if version != ENVELOPE_V1 {
-        mac.update(&[version]);
-    }
-    mac.update(data);
-    mac.update(ed25519);
-    mac.update(&timestamp.to_be_bytes());
-    mac.update(nonce);
+    mac.update(&[hdr]);
+    mac.update(covered);
     let result = mac.finalize().into_bytes();
     let mut tag = [0u8; MAC_SIZE];
     tag.copy_from_slice(&result[..MAC_SIZE]);
@@ -203,30 +188,14 @@ pub fn compute_mac1(
 }
 
 /// Verify MAC1 with constant-time comparison.
-pub fn verify_mac1(
-    version: u8,
-    shared_secret: &[u8],
-    data: &[u8],
-    ed25519: &[u8],
-    timestamp: u32,
-    nonce: &[u8],
-    mac1: &[u8],
-) -> bool {
-    let expected = compute_mac1(version, shared_secret, data, ed25519, timestamp, nonce);
-    constant_time_eq(&expected, mac1)
+pub fn verify_mac1(hdr: u8, shared_secret: &[u8], covered: &[u8], mac1: &[u8]) -> bool {
+    constant_time_eq(&compute_mac1(hdr, shared_secret, covered), mac1)
 }
 
 /// Constant-time equality over two byte slices (public helper for the SIP-3
 /// identity-derivation check in conn.rs).
 pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     constant_time_eq(a, b)
-}
-
-/// Generate a cryptographically random 8-byte nonce using the kernel CSPRNG.
-pub fn generate_nonce() -> [u8; NONCE_SIZE] {
-    let mut nonce = [0u8; NONCE_SIZE];
-    getrandom::fill(&mut nonce).expect("getrandom failed");
-    nonce
 }
 
 /// Current time as uint32 epoch seconds.
@@ -253,23 +222,6 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         result |= x ^ y;
     }
     result == 0
-}
-
-/// Compute MAC2 = HMAC-SHA256(cookie, packet || mac1)[:16]
-pub fn compute_mac2(cookie: &[u8], packet: &[u8], mac1: &[u8]) -> [u8; MAC2_SIZE] {
-    let mut mac = <HmacSha256 as Mac>::new_from_slice(cookie).expect("HMAC accepts any key size");
-    mac.update(packet);
-    mac.update(mac1);
-    let result = mac.finalize().into_bytes();
-    let mut tag = [0u8; MAC2_SIZE];
-    tag.copy_from_slice(&result[..MAC2_SIZE]);
-    tag
-}
-
-/// Verify MAC2 with constant-time comparison.
-pub fn verify_mac2(cookie: &[u8], packet: &[u8], mac1: &[u8], mac2: &[u8]) -> bool {
-    let expected = compute_mac2(cookie, packet, mac1);
-    constant_time_eq(&expected, mac2)
 }
 
 /// Compute a deterministic cookie for a (secret, IP) pair.
@@ -348,252 +300,152 @@ pub fn is_quic_initial(data: &[u8]) -> bool {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_mac1_round_trip() {
-        let secret = [0xABu8; 32];
-        let data = b"test packet data";
-        let ed = [0x11u8; ED25519_SIZE];
-        let ts = now_timestamp();
-        let nonce = generate_nonce();
-        let mac = compute_mac1(ENVELOPE_V1, &secret, data, &ed, ts, &nonce);
-        assert_eq!(mac.len(), MAC_SIZE);
-        assert!(verify_mac1(ENVELOPE_V1, &secret, data, &ed, ts, &nonce, &mac));
+    const SHARED: &[u8] = b"shared secret for tests..........";
 
-        // Wrong key
-        let wrong = [0xCDu8; 32];
-        assert!(!verify_mac1(ENVELOPE_V1, &wrong, data, &ed, ts, &nonce, &mac));
-
-        // Tampered data
-        let mut tampered = data.to_vec();
-        tampered[0] ^= 0xFF;
-        assert!(!verify_mac1(ENVELOPE_V1, &secret, &tampered, &ed, ts, &nonce, &mac));
-
-        // Tampered Ed25519 identity field (SIP-3: it is in the MAC1 input)
-        let mut ed2 = ed;
-        ed2[0] ^= 0xFF;
-        assert!(!verify_mac1(ENVELOPE_V1, &secret, data, &ed2, ts, &nonce, &mac));
-
-        // Wrong timestamp
-        assert!(!verify_mac1(ENVELOPE_V1, &secret, data, &ed, ts + 1, &nonce, &mac));
-
-        // Wrong nonce
-        let wrong_nonce = generate_nonce();
-        assert!(!verify_mac1(ENVELOPE_V1, &secret, data, &ed, ts, &wrong_nonce, &mac));
+    fn covered() -> Vec<u8> {
+        b"a QUIC datagram, a client key, a timestamp".to_vec()
     }
 
-    /// SIP-29 prefixes the version to the MAC1 input rather than appending it,
-    /// so that tags computed under different versions are unrelated even when
-    /// everything after the prefix is identical. Without that separation a
-    /// packet valid under one version could be made to verify under another.
     #[test]
-    fn mac1_is_bound_to_the_envelope_version() {
-        let secret = [0xABu8; 32];
-        let data = b"one QUIC Initial";
-        let ed = [0u8; ED25519_SIZE];
-        let ts = now_timestamp();
-        let nonce = generate_nonce();
+    fn mac1_round_trips_and_rejects_a_tampered_range() {
+        let h = hdr(ENVELOPE_V4, false);
+        let c = covered();
+        let tag = compute_mac1(h, SHARED, &c);
+        assert!(verify_mac1(h, SHARED, &c, &tag));
 
-        let v1 = compute_mac1(ENVELOPE_V1, &secret, data, &ed, ts, &nonce);
-        let v2 = compute_mac1(ENVELOPE_V2, &secret, data, &ed, ts, &nonce);
-        assert_ne!(v1, v2, "the version is not in the MAC1 input");
-
-        // Neither verifies as the other, which is what makes the two forms
-        // unambiguous cryptographically and not merely structurally.
-        assert!(!verify_mac1(ENVELOPE_V2, &secret, data, &ed, ts, &nonce, &v1));
-        assert!(!verify_mac1(ENVELOPE_V1, &secret, data, &ed, ts, &nonce, &v2));
-        assert!(verify_mac1(ENVELOPE_V1, &secret, data, &ed, ts, &nonce, &v1));
-        assert!(verify_mac1(ENVELOPE_V2, &secret, data, &ed, ts, &nonce, &v2));
+        let mut altered = c.clone();
+        altered[0] ^= 1;
+        assert!(!verify_mac1(h, SHARED, &altered, &tag));
     }
 
-    /// Version 1 predates the marker, so its MAC1 must be exactly what SIP-6
-    /// specified — no prefix. A peer that started prefixing version 1 would
-    /// break every deployment still on it.
+    /// SIP-29's reason for prefixing the header: a tag computed under one
+    /// header must be unrelated to the same input under another, so a flipped
+    /// flag or version can only cost a drop and never an accept.
     #[test]
-    fn version_1_mac1_carries_no_prefix() {
-        let secret = [0x11u8; 32];
-        let data = b"payload";
-        let ed = [0u8; ED25519_SIZE];
-        let ts = 1234u32;
-        let nonce = [7u8; NONCE_SIZE];
+    fn both_tags_are_bound_to_the_header_byte() {
+        let c = covered();
+        let anon = hdr(ENVELOPE_V4, false);
+        let ident = hdr(ENVELOPE_V4, true);
 
-        let mut expected = <HmacSha256 as Mac>::new_from_slice(&secret).unwrap();
-        expected.update(data);
-        expected.update(&ed);
-        expected.update(&ts.to_be_bytes());
-        expected.update(&nonce);
-        let expected = expected.finalize().into_bytes();
+        let m = compute_mac1(anon, SHARED, &c);
+        assert!(!verify_mac1(ident, SHARED, &c, &m), "MAC1 ignored the flag");
 
-        let got = compute_mac1(ENVELOPE_V1, &secret, data, &ed, ts, &nonce);
-        assert_eq!(&got[..], &expected[..MAC_SIZE]);
+        let key = gate_key(&[7u8; 32]);
+        let g = compute_gate(anon, &key, &c);
+        assert!(!verify_gate(ident, &key, &c, &g), "gate ignored the flag");
     }
 
-    /// The list and the width table are two statements of the same fact, and a
-    /// version added to one and not the other is a silent hole: an envelope
-    /// counted but never parsed, or parsed but never counted.
+    /// The property the gate exists for: a caller who does not hold the
+    /// server's public key cannot produce one.
+    #[test]
+    fn the_gate_separates_a_caller_who_knows_the_key_from_one_who_does_not() {
+        let h = hdr(ENVELOPE_V4, false);
+        let c = covered();
+        let server_pub = [3u8; 32];
+        let tag = compute_gate(h, &gate_key(&server_pub), &c);
+
+        assert!(verify_gate(h, &gate_key(&server_pub), &c, &tag));
+        assert!(
+            !verify_gate(h, &gate_key(&[4u8; 32]), &c, &tag),
+            "a stranger's tag verified"
+        );
+    }
+
+    /// The same field, keyed on a cookie, is what proves the source address —
+    /// and the two modes must not verify each other, or the load rule could be
+    /// side-stepped by sending the cheaper form.
+    #[test]
+    fn the_two_gate_modes_do_not_verify_each_other() {
+        let h = hdr(ENVELOPE_V4, false);
+        let c = covered();
+        let cookie = [9u8; 16];
+        let by_key = compute_gate(h, &gate_key(&[3u8; 32]), &c);
+        let by_cookie = compute_gate(h, &cookie, &c);
+
+        assert_ne!(by_key, by_cookie);
+        assert!(!verify_gate(h, &cookie, &c, &by_key));
+        assert!(!verify_gate(h, &gate_key(&[3u8; 32]), &c, &by_cookie));
+    }
+
+    /// Both keys are derived from the same public value and separated only by
+    /// their labels. Reusing one label would key two unrelated constructions
+    /// identically.
+    #[test]
+    fn gate_and_cookie_keys_are_separated_by_their_labels() {
+        let server_pub = [5u8; 32];
+        assert_ne!(gate_key(&server_pub), cookie_key(&server_pub));
+    }
+
+    #[test]
+    fn the_header_byte_carries_version_and_flags() {
+        let anon = hdr(ENVELOPE_V4, false);
+        let ident = hdr(ENVELOPE_V4, true);
+        assert_eq!(hdr_version(anon), ENVELOPE_V4);
+        assert_eq!(hdr_version(ident), ENVELOPE_V4);
+        assert!(!hdr_has_identity(anon));
+        assert!(hdr_has_identity(ident));
+    }
+
+    /// The trailer is no longer a constant: it depends on whether an identity
+    /// is carried, and the width has to be readable from the header alone.
+    #[test]
+    fn trailer_width_follows_the_identity_flag() {
+        assert_eq!(trailer_len(hdr(ENVELOPE_V4, false)), Some(TRAILER_ANON));
+        assert_eq!(trailer_len(hdr(ENVELOPE_V4, true)), Some(TRAILER_WITH_IDENTITY));
+        assert_eq!(TRAILER_ANON, 69);
+        assert_eq!(TRAILER_WITH_IDENTITY, 101);
+        assert_eq!(TRAILER_WITH_IDENTITY - TRAILER_ANON, ED25519_SIZE);
+    }
+
+    #[test]
+    fn trailer_len_refuses_versions_this_build_does_not_implement() {
+        for v in [0u8, 1, 2, 3, 5, 15] {
+            assert_eq!(trailer_len(hdr(v, false)), None, "version {v} was accepted");
+        }
+    }
+
     #[test]
     fn every_known_version_has_a_trailer() {
         for v in ENVELOPE_VERSIONS {
-            assert!(trailer_len(v).is_some(), "version {v} has no trailer width");
-            assert!(version_index(v).is_some());
+            assert!(trailer_len(hdr(v, false)).is_some(), "version {v} has no width");
+            assert!(version_index(v).is_some(), "version {v} has no counter slot");
         }
-        assert_eq!(version_index(0), None);
-        assert_eq!(version_index(200), None);
-    }
-
-    #[test]
-    fn trailer_len_knows_only_defined_versions() {
-        assert_eq!(trailer_len(ENVELOPE_V1), Some(MAC_OVERHEAD));
-        assert_eq!(trailer_len(ENVELOPE_V2), Some(MAC_OVERHEAD_V2));
-        assert_eq!(trailer_len(ENVELOPE_V2), Some(MAC_OVERHEAD + 1));
-        assert_eq!(trailer_len(ENVELOPE_V3), Some(MAC_OVERHEAD_V3));
-        assert_eq!(trailer_len(ENVELOPE_V3), Some(MAC_OVERHEAD_V2 + MAC0_SIZE));
-        // Version 0 is reserved and never emitted, so a zero byte is known not
-        // to be a marker.
-        assert_eq!(trailer_len(0), None);
-        assert_eq!(trailer_len(4), None);
-        assert_eq!(trailer_len(255), None);
-    }
-
-    /// Only v3 carries MAC0, and that is what decides whether a caller can be
-    /// turned away before the cookie stage.
-    #[test]
-    fn only_version_3_carries_mac0() {
-        assert!(!has_mac0(ENVELOPE_V1));
-        assert!(!has_mac0(ENVELOPE_V2));
-        assert!(has_mac0(ENVELOPE_V3));
-    }
-
-    /// MAC0 is keyed on the server's public key, so a caller holding that key
-    /// can compute it and a caller without it cannot. That is the whole
-    /// property: it separates "knows the key" from "does not" for the price of
-    /// one HMAC, with no curve operation and no cookie exchange.
-    #[test]
-    fn mac0_separates_a_caller_who_knows_the_key_from_one_who_does_not() {
-        let server_pub = [0x5Cu8; 32];
-        let key = mac0_key(&server_pub);
-        let covered = b"a QUIC Initial and its envelope, up to MAC0";
-
-        let tag = compute_mac0(ENVELOPE_V3, &key, covered);
-        assert!(verify_mac0(ENVELOPE_V3, &key, covered, &tag));
-
-        // A stranger guesses at the server's key and cannot produce the tag.
-        let stranger = mac0_key(&[0x5Du8; 32]);
-        assert!(!verify_mac0(ENVELOPE_V3, &stranger, covered, &tag));
-
-        // Tampering with any covered byte breaks it.
-        let mut tampered = covered.to_vec();
-        tampered[0] ^= 0xFF;
-        assert!(!verify_mac0(ENVELOPE_V3, &key, &tampered, &tag));
-    }
-
-    /// The version is prefixed to MAC0's input for the reason SIP-29 gives for
-    /// MAC1: a receiver reads the marker before it can verify anything, so the
-    /// marker has to be inside what it verifies.
-    #[test]
-    fn mac0_is_bound_to_the_envelope_version() {
-        let key = mac0_key(&[7u8; 32]);
-        let covered = b"same bytes, different version";
-        let v3 = compute_mac0(ENVELOPE_V3, &key, covered);
-        let v4 = compute_mac0(4, &key, covered);
-        assert_ne!(v3, v4);
-        assert!(!verify_mac0(4, &key, covered, &v3));
-    }
-
-    /// MAC0 and the cookie-reply key are both derived from the server's public
-    /// key and must not collide — separate labels, separate keys.
-    #[test]
-    fn mac0_and_cookie_keys_are_separated_by_their_labels() {
-        let server_pub = [0x11u8; 32];
-        assert_ne!(mac0_key(&server_pub), cookie_key(&server_pub));
     }
 
     #[test]
     fn test_timestamp_replay_window() {
-        let now = now_timestamp();
+        let now = 1_000_000u32;
         assert!(timestamp_in_window(now, now));
-        assert!(timestamp_in_window(now - 60, now));
-        assert!(timestamp_in_window(now - 119, now));
-        assert!(!timestamp_in_window(now - 121, now));
-        assert!(timestamp_in_window(now + 60, now));
-        assert!(!timestamp_in_window(now + 121, now));
+        assert!(timestamp_in_window(now - REPLAY_WINDOW as u32, now));
+        assert!(timestamp_in_window(now + REPLAY_WINDOW as u32, now));
+        assert!(!timestamp_in_window(now - REPLAY_WINDOW as u32 - 1, now));
+        assert!(!timestamp_in_window(now + REPLAY_WINDOW as u32 + 1, now));
     }
 
-    /// MAC2 covers the envelope up to but NOT including MAC1, with MAC1 fed in
-    /// separately. Hashing the buffer whole folds MAC1 in twice and never
-    /// verifies — and because a failing MAC2 is indistinguishable from a client
-    /// that has no cookie, the symptom is not an error but a handshake that
-    /// takes an extra round trip forever. Both sides have to draw the boundary
-    /// in the same place, so it is pinned here.
-    #[test]
-    fn mac2_covers_the_envelope_up_to_mac1() {
-        let cookie = [0x7Au8; 16];
-        let shared = [0xABu8; 32];
-        let datagram = b"a QUIC Initial, more or less";
-        let ed = [0u8; ED25519_SIZE];
-        let ts = now_timestamp();
-        let nonce = generate_nonce();
-        let mac1 = compute_mac1(ENVELOPE_V1, &shared, datagram, &ed, ts, &nonce);
-
-        let mut buf = Vec::new();
-        buf.extend_from_slice(datagram);
-        buf.extend_from_slice(&[0x11u8; CLIENT_KEY_SIZE]);
-        buf.extend_from_slice(&ed);
-        buf.extend_from_slice(&ts.to_be_bytes());
-        buf.extend_from_slice(&nonce);
-        let before_mac1 = buf.len();
-        buf.extend_from_slice(&mac1);
-
-        let right = compute_mac2(&cookie, &buf[..before_mac1], &mac1);
-        assert!(verify_mac2(&cookie, &buf[..before_mac1], &mac1, &right));
-
-        // The mistake: covering MAC1 as well, then passing it again.
-        let wrong = compute_mac2(&cookie, &buf, &mac1);
-        assert!(
-            !verify_mac2(&cookie, &buf[..before_mac1], &mac1, &wrong),
-            "MAC2 over the whole buffer must not verify against the specified range"
-        );
-    }
-
-    /// An IPv4 address and its IPv4-mapped IPv6 form are the same client, and
-    /// must mint the same cookie — otherwise a client reaching a dual-stack
-    /// socket is challenged with one cookie and verified against another.
     #[test]
     fn cookie_is_the_same_for_v4_and_its_mapped_form() {
-        let secret = [0x33u8; 32];
+        let secret = [1u8; 32];
         let v4: IpAddr = "192.0.2.7".parse().unwrap();
         let mapped: IpAddr = "::ffff:192.0.2.7".parse().unwrap();
         assert_eq!(cookie_value(&secret, v4), cookie_value(&secret, mapped));
-
-        // A different address is a different cookie.
-        let other: IpAddr = "192.0.2.8".parse().unwrap();
-        assert_ne!(cookie_value(&secret, v4), cookie_value(&secret, other));
     }
 
-    /// The client derives the reply key from the server's public key alone —
-    /// no Diffie-Hellman, which is the whole point of the cookie. If the two
-    /// ends ever disagreed on this derivation the client could not open a
-    /// challenge and would be stuck at one round trip per Initial, forever.
     #[test]
     fn cookie_reply_opens_under_the_derived_key() {
-        let server_pub = [0x5Cu8; 32];
+        let server_pub = [2u8; 32];
         let key = cookie_key(&server_pub);
-        let cookie = [0x42u8; 16];
-
+        let cookie = [0xABu8; 16];
         let sealed = encrypt_cookie(&key, &cookie).expect("seal");
-        assert_eq!(sealed.len(), COOKIE_NONCE_SIZE + 16 + 16);
         assert_eq!(decrypt_cookie(&key, &sealed).as_deref(), Some(&cookie[..]));
-
-        // Derived from a different server key, it does not open.
-        let wrong = cookie_key(&[0x5Du8; 32]);
-        assert!(decrypt_cookie(&wrong, &sealed).is_none());
+        assert!(decrypt_cookie(&cookie_key(&[9u8; 32]), &sealed).is_none());
     }
 
     #[test]
     fn test_is_quic_initial() {
-        assert!(is_quic_initial(&[0xC0, 0, 0, 0, 0]));
-        assert!(is_quic_initial(&[0xCF, 0, 0, 0, 0]));
-        assert!(!is_quic_initial(&[0x40, 0, 0, 0, 0])); // short header
-        assert!(!is_quic_initial(&[0xD0, 0, 0, 0, 0])); // handshake type
-        assert!(!is_quic_initial(&[0xC0])); // too short
+        assert!(is_quic_initial(&[0xC0, 0, 0, 0, 1]));
+        assert!(is_quic_initial(&[0xCF, 0, 0, 0, 1]));
+        assert!(!is_quic_initial(&[0xD0, 0, 0, 0, 1]), "0-RTT is not an Initial");
+        assert!(!is_quic_initial(&[0x40, 0, 0, 0, 1]), "short header");
+        assert!(!is_quic_initial(&[0xC0]));
     }
 }

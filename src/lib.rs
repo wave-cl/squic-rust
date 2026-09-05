@@ -174,39 +174,26 @@ pub struct Config {
     /// in, since the identity is server-visible plaintext.
     pub advertise_identity: bool,
     /// DH operations per second before the server enters under-load mode and
-    /// starts requiring a cookie (MAC2) from callers it has not challenged yet.
+    /// starts requiring a cookie-keyed gate tag from callers it has not
+    /// challenged yet.
     /// Default: 1000. `Some(0)` disables the cookie defence entirely.
     pub load_threshold: Option<u64>,
     /// SIP-29: the envelope version this client emits.
     ///
-    /// Default: `ENVELOPE_V3` as of v0.20.0. It was `ENVELOPE_V2` in v0.19.0,
-    /// which introduced version 3 — the discipline SIP-29 requires is that a
-    /// release introducing a version ships clients still sending the previous
-    /// one, so upgrading a client before a server cannot break anything, and a
-    /// later release moves the default once servers have deployed. This is
-    /// that later release.
+    /// Default and only implemented version: `ENVELOPE_V4`. Versions 1 to 3
+    /// were removed rather than deprecated — a version that has to be narrowed
+    /// *to* in order to be safe will be left wide somewhere, and versions 1 and
+    /// 2 carried no cheap gate at all, so a default that included them handed
+    /// every stranger a curve operation.
     ///
-    /// Version 3 is what carries MAC0 (SIP-37), so this is also the release
-    /// that lets a deployment retire versions 1 and 2 and get a server that
-    /// stays silent under load.
-    ///
-    /// Set it back to `ENVELOPE_V2` if you still talk to a server older than
-    /// squic v0.19.0, or to `ENVELOPE_V1` for one older than v0.17.0. Either
-    /// will drop a version 3 Initial in silence, so the symptom of aiming too
-    /// high is a handshake timeout with no diagnostic.
+    /// Kept as a setting because the next transition will need it, not because
+    /// there is anything to choose today.
     pub envelope_version: u8,
     /// SIP-29: the envelope versions this server parses.
     ///
-    /// Default: all of them, so a server can be upgraded without waiting for
-    /// its clients. Drop older versions to retire them — which a deployment
-    /// MUST be able to do, or the oldest envelope ever defined becomes a
-    /// permanent floor.
-    ///
-    /// Retiring v1 and v2 is what finishes the job v3 starts. Only v3 carries
-    /// MAC0, so only a v3 caller can be turned away before the cookie stage; a
-    /// server still accepting v1 or v2 will keep answering callers on those
-    /// versions with a cookie while it is under load, whatever they know. Set
-    /// this to `vec![ENVELOPE_V3]` once the clients have moved.
+    /// Default: `[ENVELOPE_V4]`, the only version implemented. The mechanism
+    /// survives for the next transition; what does not survive is a default
+    /// that admits a weaker version than the one the client sends.
     pub accepted_envelope_versions: Vec<u8>,
 }
 
@@ -231,12 +218,8 @@ impl Default for Config {
             client_key: None,
             advertise_identity: false,
             load_threshold: None,
-            envelope_version: crate::mac::ENVELOPE_V3,
-            accepted_envelope_versions: vec![
-                crate::mac::ENVELOPE_V1,
-                crate::mac::ENVELOPE_V2,
-                crate::mac::ENVELOPE_V3,
-            ],
+            envelope_version: crate::mac::ENVELOPE_V4,
+            accepted_envelope_versions: vec![crate::mac::ENVELOPE_V4],
         }
     }
 }
@@ -531,14 +514,14 @@ pub async fn dial(
     let socket = Arc::new(tokio::net::UdpSocket::from_std(std_socket).map_err(Error::Io)?);
 
     let cookie_key = crate::mac::cookie_key(server_x25519_pub.as_bytes());
-    let mac0_key = crate::mac::mac0_key(server_x25519_pub.as_bytes());
+    let gate_key = crate::mac::gate_key(server_x25519_pub.as_bytes());
     let client_socket = ClientSocket::new(
         socket,
         conn::ClientKeys {
             shared_secret: shared,
             client_pub_key: client_x25519_pub.to_bytes(),
             advertise_ed25519,
-            mac0_key,
+            gate_key,
             cookie_key,
         },
         addr,

@@ -1,10 +1,9 @@
 use crate::mac::{
-    compute_mac0, compute_mac1, compute_mac2, cookie_value, ct_eq, decrypt_cookie, encrypt_cookie,
-    generate_nonce, has_mac0, is_quic_initial, now_timestamp, timestamp_in_window, trailer_len,
-    verify_mac0, verify_mac1, verify_mac2,
-    CLIENT_KEY_SIZE, COOKIE_REPLY_TYPE, COOKIE_SECRET_LIFETIME_SECS, ED25519_SIZE, ENVELOPE_V1,
-    ENVELOPE_VERSIONS, MAC0_SIZE, MAC2_SIZE,
-    MAC_SIZE, NONCE_SIZE, TIMESTAMP_SIZE,
+    CLIENT_KEY_SIZE, COOKIE_REPLY_TYPE, COOKIE_SECRET_LIFETIME_SECS, ED25519_SIZE,
+    ENVELOPE_VERSIONS, GATE_SIZE, MAC_SIZE, TIMESTAMP_SIZE, TRAILER_WITH_IDENTITY, compute_gate,
+    compute_mac1, cookie_value, ct_eq, decrypt_cookie, encrypt_cookie, hdr, hdr_has_identity,
+    hdr_version, is_quic_initial, now_timestamp, timestamp_in_window, trailer_len, verify_gate,
+    verify_mac1,
 };
 use crate::crypto::ed25519_identity_to_x25519;
 use crate::whitelist::Whitelist;
@@ -264,7 +263,7 @@ pub struct ServerSocket {
     server_x25519_priv: X25519Secret,
     whitelist: Arc<Whitelist>,
     /// Keys MAC0 (envelope v3), derived from our own public key.
-    mac0_key: [u8; 32],
+    gate_key: [u8; 32],
     // MAC2 + cookie DDoS protection
     cookie_key: [u8; 32],
     cookie_secret: RwLock<[u8; 32]>,
@@ -346,7 +345,7 @@ impl ServerSocket {
         let inner = socket_state(&socket);
         let server_pub = X25519Public::from(&server_x25519_priv);
         let cookie_key = crate::mac::cookie_key(server_pub.as_bytes());
-        let mac0_key = crate::mac::mac0_key(server_pub.as_bytes());
+        let gate_key = crate::mac::gate_key(server_pub.as_bytes());
         let mut secret = [0u8; 32];
         getrandom::fill(&mut secret).expect("getrandom failed");
         Self {
@@ -354,7 +353,7 @@ impl ServerSocket {
             inner,
             server_x25519_priv,
             whitelist,
-            mac0_key,
+            gate_key,
             cookie_key,
             // The previous secret starts out equal to the current one rather
             // than random: until the first rotation there is no earlier secret,
@@ -406,32 +405,21 @@ impl ServerSocket {
             return Some(len); // non-Initial passes through
         }
 
-        let marked = buf[len - 1];
-        let mut challenge = false;
-
-        // A marked version, if we accept it and it is not the unmarked one.
-        if marked != ENVELOPE_V1 && self.accepts(marked) {
-            match self.try_version(marked, buf, len, addr) {
-                Outcome::Accepted(quic_len) => return Some(quic_len),
-                Outcome::Challenge => challenge = true,
-                Outcome::Drop => {}
+        // One version, so one layout: read the header byte and validate. The
+        // guessing this replaced — try the marked version, then try unmarked v1
+        // — is what let a single datagram be parsed twice, and with it buy two
+        // curve operations from a server that had accepted the older versions.
+        let hdr = buf[len - 1];
+        match self.validate_envelope(hdr, buf, len, addr) {
+            Outcome::Accepted(quic_len) => Some(quic_len),
+            Outcome::Challenge => {
+                if let Some(a) = addr {
+                    self.send_cookie_reply(a);
+                }
+                None
             }
+            Outcome::Drop => None,
         }
-
-        // Then the unmarked form, which is the only version that needs guessing.
-        if self.accepts(ENVELOPE_V1) {
-            match self.try_version(ENVELOPE_V1, buf, len, addr) {
-                Outcome::Accepted(quic_len) => return Some(quic_len),
-                Outcome::Challenge => challenge = true,
-                Outcome::Drop => {}
-            }
-        }
-
-        // At most one challenge per datagram, however many layouts were tried.
-        if challenge && let Some(a) = addr {
-            self.send_cookie_reply(a);
-        }
-        None
     }
 
     /// Whether this server parses `version`.
@@ -439,18 +427,21 @@ impl ServerSocket {
         self.accepted_versions.contains(&version)
     }
 
-    /// Validate one Initial under one envelope version.
+    /// Validate one Initial.
     ///
-    /// Returns `Challenge` rather than sending the cookie reply itself, so that
-    /// trying two layouts cannot challenge the same caller twice.
-    fn try_version(
+    /// Returns `Challenge` rather than sending the cookie reply itself, so the
+    /// caller owns the one-reply-per-datagram rule.
+    fn validate_envelope(
         &self,
-        version: u8,
+        hdr: u8,
         buf: &[u8],
         len: usize,
         addr: Option<SocketAddr>,
     ) -> Outcome {
-        let Some(trailer) = trailer_len(version) else {
+        if !self.accepts(hdr_version(hdr)) {
+            return Outcome::Drop;
+        }
+        let Some(trailer) = trailer_len(hdr) else {
             return Outcome::Drop;
         };
         if len <= trailer {
@@ -461,80 +452,79 @@ impl ServerSocket {
         let mut off = quic_len;
         let client_pub = &buf[off..off + CLIENT_KEY_SIZE];
         off += CLIENT_KEY_SIZE;
-        let ed25519 = &buf[off..off + ED25519_SIZE];
-        off += ED25519_SIZE;
-        let ts_bytes = &buf[off..off + TIMESTAMP_SIZE];
-        off += TIMESTAMP_SIZE;
-        let nonce = &buf[off..off + NONCE_SIZE];
-        off += NONCE_SIZE;
-        // MAC0 covers everything up to here, contiguously.
-        let mac0_end = off;
-        let mac0 = if has_mac0(version) {
-            let m = &buf[off..off + MAC0_SIZE];
-            off += MAC0_SIZE;
-            Some(m)
+        // SIP-3: carried only when the header says so. Version 3 sent 32 zero
+        // bytes on every anonymous Initial to say the same thing.
+        let ed25519 = if hdr_has_identity(hdr) {
+            let e = &buf[off..off + ED25519_SIZE];
+            off += ED25519_SIZE;
+            Some(e)
         } else {
             None
         };
-        let mac1_start = off;
+        let ts_bytes = &buf[off..off + TIMESTAMP_SIZE];
+        off += TIMESTAMP_SIZE;
+        // Both tags cover exactly this range, contiguously from offset 0.
+        let covered = &buf[..off];
+        let gate = &buf[off..off + GATE_SIZE];
+        off += GATE_SIZE;
         let mac1 = &buf[off..off + MAC_SIZE];
-        off += MAC_SIZE;
-        let mac2 = &buf[off..off + MAC2_SIZE];
 
         let timestamp = u32::from_be_bytes([ts_bytes[0], ts_bytes[1], ts_bytes[2], ts_bytes[3]]);
 
-        // Step 1: Replay protection (cheap)
+        // Step 1: replay window (cheap)
         if !timestamp_in_window(timestamp, now_timestamp()) {
             return Outcome::Drop;
         }
 
-        // Step 2: MAC0 — the cheap gate (envelope v3).
+        // Step 2: the gate — one HMAC, before any curve operation.
         //
-        // This is the step that makes the cookie defence below silent. MAC1 is
-        // a Diffie-Hellman, so without something cheap in front of it a server
-        // cannot tell a caller who knows its public key from a stranger, and
-        // must therefore challenge both — which is how a server under load ends
-        // up answering everybody. MAC0 costs one HMAC and settles that question
-        // before the challenge is issued, and before the curve operation, so
-        // rubbish never reaches either.
+        // MAC1 is a Diffie-Hellman, so without something cheap in front of it a
+        // server cannot tell a caller who knows its public key from a stranger,
+        // and must challenge both — which is how a server under load ends up
+        // answering everybody. The gate settles that question first.
         //
-        // Versions 1 and 2 carry no MAC0 and skip this. A caller on those
-        // versions is still challenged without proving anything, so this closes
-        // the hole only for v3 traffic — and closes it outright once a
-        // deployment retires the older versions.
-        if let Some(mac0) = mac0
-            && !verify_mac0(version, &self.mac0_key, &buf[..mac0_end], mac0)
-        {
-            return Outcome::Drop;
-        }
-
-        // Step 3: MAC2 check — if under load, require valid MAC2
+        // Which key proves what:
+        //
+        //   under load      the cookie, and only the cookie. A caller that
+        //                   cannot produce it is challenged and dropped. There
+        //                   is deliberately no fallback to the public-key form:
+        //                   that fallback would hand back an unvalidated source
+        //                   address, which is the one thing the cookie exists
+        //                   to establish and the one thing a single datagram
+        //                   cannot demonstrate.
+        //
+        //   not under load  the public-key form, then the cookie. A client that
+        //                   answered a challenge during an earlier burst still
+        //                   holds one, and should not be made to re-handshake
+        //                   because the load subsided. Two HMACs at worst,
+        //                   still far below one X25519.
         if self.under_load.load(Ordering::Relaxed) {
-            let is_zero = mac2.iter().all(|&b| b == 0);
-            let mut mac2_valid = false;
-
-            if !is_zero
-                && let Some(a) = addr
-            {
-                let ip = a.ip();
-                let data_before_mac2 = &buf[..mac1_start];
-                let secret = *self.cookie_secret.read().unwrap();
-                let cookie = cookie_value(&secret, ip);
-                if verify_mac2(&cookie, data_before_mac2, mac1, mac2) {
-                    mac2_valid = true;
-                } else {
-                    let prev = *self.prev_cookie_secret.read().unwrap();
-                    let cookie = cookie_value(&prev, ip);
-                    if verify_mac2(&cookie, data_before_mac2, mac1, mac2) {
-                        mac2_valid = true;
-                    }
-                }
-            }
-
-            if mac2_valid {
+            // Three outcomes, and the middle one is the whole of SIP-37:
+            //
+            //   cookie-keyed   proves the key *and* the address. Accept.
+            //   key-keyed      proves the key but not the address. Challenge —
+            //                  this caller is worth a 57-byte reply, and the
+            //                  reply tells them nothing they did not already
+            //                  know, since they demonstrated the key to get here.
+            //   neither        proves nothing. Silence.
+            //
+            // Challenging on a failed cookie check alone would answer strangers
+            // too, which is the defect MAC0 was added to close: a server under
+            // load that replies to anyone has stopped being silent exactly when
+            // it matters most.
+            if addr.is_some_and(|a| self.gate_matches_cookie(hdr, covered, gate, a.ip())) {
                 self.mac2_verified.fetch_add(1, Ordering::Relaxed);
-            } else {
+            } else if verify_gate(hdr, &self.gate_key, covered, gate) {
                 return Outcome::Challenge;
+            } else {
+                return Outcome::Drop;
+            }
+        } else {
+            let by_key = verify_gate(hdr, &self.gate_key, covered, gate);
+            if !by_key
+                && !addr.is_some_and(|a| self.gate_matches_cookie(hdr, covered, gate, a.ip()))
+            {
+                return Outcome::Drop;
             }
         }
 
@@ -560,15 +550,7 @@ impl ServerSocket {
             return Outcome::Drop;
         }
 
-        if !verify_mac1(
-            version,
-            shared.as_bytes(),
-            &buf[..quic_len],
-            ed25519,
-            timestamp,
-            nonce,
-            mac1,
-        ) {
+        if !verify_mac1(hdr, shared.as_bytes(), covered, mac1) {
             return Outcome::Drop;
         }
 
@@ -590,13 +572,14 @@ impl ServerSocket {
         // All zeros means "no identity asserted". It is a *valid* point — the
         // order-4 point, deriving to u = 1 — not an invalid encoding, so it is
         // matched explicitly rather than left to fail the derivation.
-        let identity = if ed25519.iter().all(|&b| b == 0) {
-            None
-        } else {
-            let ed_arr: [u8; 32] = ed25519.try_into().expect("ED25519_SIZE == 32");
-            match ed25519_identity_to_x25519(&ed_arr) {
-                Ok(derived) if ct_eq(derived.as_bytes(), &key) => Some(ed_arr),
-                _ => return Outcome::Drop,
+        let identity = match ed25519 {
+            None => None,
+            Some(e) => {
+                let ed_arr: [u8; 32] = e.try_into().expect("ED25519_SIZE == 32");
+                match ed25519_identity_to_x25519(&ed_arr) {
+                    Ok(derived) if ct_eq(derived.as_bytes(), &key) => Some(ed_arr),
+                    _ => return Outcome::Drop,
+                }
             }
         };
 
@@ -606,10 +589,26 @@ impl ServerSocket {
             self.peer_table.record(dcid, key, identity, Instant::now());
         }
 
-        if let Some(i) = crate::mac::version_index(version) {
+        if let Some(i) = crate::mac::version_index(hdr_version(hdr)) {
             self.accepted[i].fetch_add(1, Ordering::Relaxed);
         }
         Outcome::Accepted(quic_len)
+    }
+
+    /// Whether `gate` verifies under the cookie for `ip`, trying the current
+    /// secret and then the previous one.
+    ///
+    /// Two secrets because they rotate on a timer: a caller that answered a
+    /// challenge seconds before a rotation holds a cookie derived from the
+    /// older one, and refusing it would turn a routine rotation into a failed
+    /// handshake.
+    fn gate_matches_cookie(&self, hdr: u8, covered: &[u8], gate: &[u8], ip: IpAddr) -> bool {
+        let current = *self.cookie_secret.read().unwrap();
+        if verify_gate(hdr, &cookie_value(&current, ip), covered, gate) {
+            return true;
+        }
+        let prev = *self.prev_cookie_secret.read().unwrap();
+        verify_gate(hdr, &cookie_value(&prev, ip), covered, gate)
     }
 
     /// The MAC1-verified peer X25519 key recorded for `dcid`, if any (SIP-2).
@@ -826,7 +825,7 @@ pub struct ClientSocket {
     /// timeout would say nothing about which version it wanted.
     envelope_version: u8,
     /// Keys MAC0 (envelope v3), derived from the server's public key.
-    mac0_key: [u8; 32],
+    gate_key: [u8; 32],
     cookie_key: [u8; 32], // decrypts cookie replies; derived from the server's public key
     handshake_done: AtomicBool, // true after first non-cookie packet received; skips the cookie scan
     cookie: RwLock<Option<[u8; 16]>>, // decrypted cookie from the server, keys MAC2
@@ -851,7 +850,7 @@ pub struct ClientKeys {
     /// SIP-3: the Ed25519 identity to advertise, or all zeros for none.
     pub advertise_ed25519: [u8; 32],
     /// Keys MAC0 (envelope v3); derived from the server's public key.
-    pub mac0_key: [u8; 32],
+    pub gate_key: [u8; 32],
     /// Decrypts cookie replies; derived from the server's public key.
     pub cookie_key: [u8; 32],
 }
@@ -867,7 +866,7 @@ impl ClientSocket {
             shared_secret,
             client_pub_key,
             advertise_ed25519,
-            mac0_key,
+            gate_key,
             cookie_key,
         } = keys;
         let inner = socket_state(&socket);
@@ -879,7 +878,7 @@ impl ClientSocket {
             advertise_ed25519,
             server_addr,
             envelope_version,
-            mac0_key,
+            gate_key,
             cookie_key,
             handshake_done: AtomicBool::new(false),
             cookie: RwLock::new(None),
@@ -1001,53 +1000,37 @@ impl ClientSocket {
     /// `ServerSocket::validate_and_strip` expects — the two sides disagreeing
     /// about what MAC2 covers is exactly the defect this guards.
     fn build_initial(&self, datagram: &[u8], cookie: Option<&[u8; 16]>) -> Vec<u8> {
+        // An identity is carried only when there is one to carry. The header
+        // byte says which, so the server knows the trailer's width before it
+        // parses anything.
+        let has_identity = self.advertise_ed25519 != [0u8; 32];
+        let h = hdr(self.envelope_version, has_identity);
         let ts = now_timestamp();
-        let nonce = generate_nonce();
-        let mac1 = compute_mac1(
-            self.envelope_version,
-            &self.shared_secret,
-            datagram,
-            &self.advertise_ed25519,
-            ts,
-            &nonce,
-        );
-        let mut buf = Vec::with_capacity(datagram.len() + crate::mac::MAC_OVERHEAD_V3);
+
+        let mut buf = Vec::with_capacity(datagram.len() + TRAILER_WITH_IDENTITY);
         buf.extend_from_slice(datagram);
         buf.extend_from_slice(&self.client_pub_key);
-        buf.extend_from_slice(&self.advertise_ed25519);
-        buf.extend_from_slice(&ts.to_be_bytes());
-        buf.extend_from_slice(&nonce);
-
-        // MAC0 (v3): computed over exactly the bytes written so far, which is
-        // the contiguous range the server hashes.
-        if has_mac0(self.envelope_version) {
-            let mac0 = compute_mac0(self.envelope_version, &self.mac0_key, &buf);
-            buf.extend_from_slice(&mac0);
+        if has_identity {
+            buf.extend_from_slice(&self.advertise_ed25519);
         }
+        buf.extend_from_slice(&ts.to_be_bytes());
 
+        // Both tags cover exactly the bytes written so far, which is the
+        // contiguous range the server hashes. The gate's key is the whole
+        // difference between the two modes: the cookie when we hold one, the
+        // server's public key otherwise.
+        let gate_key: &[u8] = match cookie {
+            Some(c) => c,
+            None => &self.gate_key,
+        };
+        let gate = compute_gate(h, gate_key, &buf);
+        let mac1 = compute_mac1(h, &self.shared_secret, &buf);
+        buf.extend_from_slice(&gate);
         buf.extend_from_slice(&mac1);
 
-        // MAC2: zeros if no cookie, computed if the server has sent us one.
-        //
-        // The server verifies over everything up to but NOT including mac1,
-        // passing mac1 separately, so the slice here has to stop short of the
-        // mac1 we just appended. Hashing buf whole folds mac1 in twice and
-        // never verifies.
-        match cookie {
-            Some(c) => {
-                let mac2 = compute_mac2(c, &buf[..buf.len() - MAC_SIZE], &mac1);
-                buf.extend_from_slice(&mac2);
-            }
-            None => buf.extend_from_slice(&[0u8; MAC2_SIZE]),
-        }
-
-        // SIP-29: the marker goes last, after MAC2, because that is the only
-        // offset a receiver can find without already knowing the trailer's
-        // width. Version 1 predates it and emits nothing, which is what keeps
-        // this client able to talk to a server that has not moved yet.
-        if self.envelope_version != ENVELOPE_V1 {
-            buf.push(self.envelope_version);
-        }
+        // SIP-29: the header goes last, because that is the only offset a
+        // receiver can find without already knowing the trailer's width.
+        buf.push(h);
         buf
     }
 }
@@ -1196,7 +1179,7 @@ use std::task::ready;
 mod tests {
     use super::*;
     use crate::crypto::{ed25519_private_to_x25519, x25519};
-    use crate::mac::{cookie_key, ENVELOPE_V2, ENVELOPE_V3};
+    use crate::mac::{ENVELOPE_V4, GATE_SIZE, TRAILER_ANON, cookie_key};
     use std::task::Waker;
 
     async fn socket() -> Arc<tokio::net::UdpSocket> {
@@ -1204,9 +1187,9 @@ mod tests {
     }
 
     /// Build a matched client and server over loopback sockets, with the
-    /// client emitting version 1 and the server accepting both (SIP-29).
+    /// client and server both on version 4, the only version implemented.
     async fn pair() -> (ServerSocket, ClientSocket) {
-        pair_with(ENVELOPE_V1, vec![ENVELOPE_V1, ENVELOPE_V2, ENVELOPE_V3]).await
+        pair_with(ENVELOPE_V4, vec![ENVELOPE_V4]).await
     }
 
     /// As `pair`, choosing which envelope version the client emits and which
@@ -1239,7 +1222,7 @@ mod tests {
                 client_pub_key: client_pub.to_bytes(),
                 // advertise no Ed25519 identity (random X25519 test key)
                 advertise_ed25519: [0u8; 32],
-                mac0_key: crate::mac::mac0_key(server_pub.as_bytes()),
+                gate_key: crate::mac::gate_key(server_pub.as_bytes()),
                 cookie_key: cookie_key(server_pub.as_bytes()),
             },
             server_addr,
@@ -1351,19 +1334,21 @@ mod tests {
         // The attacker assumes the exchange yields zeros, and is right.
         let assumed_shared = [0u8; 32];
 
-        let ed = [0u8; 32];
         let ts = now_timestamp();
-        let nonce = generate_nonce();
-        let mac1 = compute_mac1(ENVELOPE_V1, &assumed_shared, &datagram, &ed, ts, &nonce);
+        let h = hdr(ENVELOPE_V4, false);
 
         let mut buf = Vec::new();
         buf.extend_from_slice(&datagram);
         buf.extend_from_slice(&zero_key);
-        buf.extend_from_slice(&ed);
         buf.extend_from_slice(&ts.to_be_bytes());
-        buf.extend_from_slice(&nonce);
+        // The attacker holds the server's public key, so the gate is no
+        // obstacle — which is the point: the small-order check below is what
+        // has to stop this, not the gate.
+        let gate = compute_gate(h, &server.gate_key, &buf);
+        let mac1 = compute_mac1(h, &assumed_shared, &buf);
+        buf.extend_from_slice(&gate);
         buf.extend_from_slice(&mac1);
-        buf.extend_from_slice(&[0u8; MAC2_SIZE]);
+        buf.push(h);
         let len = buf.len();
 
         assert_eq!(
@@ -1423,188 +1408,140 @@ mod tests {
         quic_initial(DATAGRAM)
     }
 
-    /// A version 2 client and a server that accepts version 2 agree on the
-    /// whole envelope: the marker's position, the trailer's width, and the
-    /// version prefix in MAC1.
+    /// The whole envelope agreed end to end: the header's position, the
+    /// trailer's width, and the header prefix in both tags.
     #[tokio::test]
-    async fn version_2_round_trips() {
-        let (server, client) = pair_with(ENVELOPE_V2, vec![ENVELOPE_V1, ENVELOPE_V2]).await;
-        let mut envelope = client.build_initial(&initial(), None);
-        assert_eq!(envelope.len(), DATAGRAM + crate::mac::MAC_OVERHEAD_V2);
-        assert_eq!(*envelope.last().unwrap(), ENVELOPE_V2, "marker is not last");
+    async fn version_4_round_trips() {
+        let (server, client) = pair().await;
+        let mut env = client.build_initial(&initial(), None);
+        let len = env.len();
+        assert_eq!(len, DATAGRAM + TRAILER_ANON);
+        assert_eq!(hdr_version(env[len - 1]), ENVELOPE_V4);
+        assert!(!hdr_has_identity(env[len - 1]));
 
-        let len = envelope.len();
         assert_eq!(
-            server.validate_and_strip(&mut envelope, len, None),
-            Some(DATAGRAM)
+            server.validate_and_strip(&mut env, len, None),
+            Some(DATAGRAM),
+            "a matched client and server disagreed about the envelope"
         );
     }
 
-    /// The transition case, and the reason this SIP is worth having: one server
-    /// serving both versions at once.
+    /// The 32 bytes version 3 spent on every anonymous Initial. The field is
+    /// carried only when there is an identity, and the header says which, so
+    /// the server knows the width before it parses.
     #[tokio::test]
-    async fn a_server_serves_both_versions_at_once() {
-        for version in [ENVELOPE_V1, ENVELOPE_V2] {
-            let (server, client) = pair_with(version, vec![ENVELOPE_V1, ENVELOPE_V2]).await;
-            let mut envelope = client.build_initial(&initial(), None);
-            let len = envelope.len();
+    async fn an_anonymous_envelope_is_32_bytes_shorter_than_one_with_an_identity() {
+        let (_s, anon) = pair().await;
+        assert_eq!(anon.build_initial(&initial(), None).len(), DATAGRAM + TRAILER_ANON);
+        assert_eq!(TRAILER_WITH_IDENTITY - TRAILER_ANON, ED25519_SIZE);
+    }
+
+    /// A server refuses a version it does not implement, and says nothing.
+    #[tokio::test]
+    async fn an_unimplemented_version_is_dropped() {
+        let (server, client) = pair().await;
+        for v in [1u8, 2, 3, 5] {
+            let mut env = client.build_initial(&initial(), None);
+            let len = env.len();
+            env[len - 1] = hdr(v, false);
             assert_eq!(
-                server.validate_and_strip(&mut envelope, len, None),
-                Some(DATAGRAM),
-                "server accepting both refused version {version}"
+                server.validate_and_strip(&mut env, len, None),
+                None,
+                "a server parsed envelope version {v}"
             );
         }
     }
 
-    /// A version 1 packet's last byte is the last byte of MAC2. With no cookie
-    /// that is deterministically zero — the reserved version, never a marker —
-    /// so the collision only arises for a packet carrying a real MAC2, which
-    /// means one issued under load. Forced here, because one in 256 is not a
-    /// thing to leave to chance in a test.
+    /// The measurement behind the second audit's first finding, as a test:
+    /// junk costs one HMAC and no curve operation, whatever it claims to be.
     #[tokio::test]
-    async fn a_version_1_packet_naming_version_2_still_gets_through() {
-        let (server, client) = pair_with(ENVELOPE_V1, vec![ENVELOPE_V1, ENVELOPE_V2]).await;
-        let mut envelope = client.build_initial(&initial(), None);
-        assert_eq!(*envelope.last().unwrap(), 0, "no cookie should mean a zero tail");
+    async fn junk_never_reaches_the_diffie_hellman() {
+        let (server, _client) = pair().await;
+        let before = server.dh_count.load(Ordering::Relaxed);
 
-        // Now make it look like a version 2 marker. Not under load, so MAC2's
-        // contents are never examined and only the dispatch changes.
-        *envelope.last_mut().unwrap() = ENVELOPE_V2;
-        let len = envelope.len();
+        for marker in [1u8, 2, 3, 4] {
+            let mut junk = quic_initial(DATAGRAM + TRAILER_ANON);
+            let len = junk.len();
+            let ts_at = len - TRAILER_ANON + CLIENT_KEY_SIZE;
+            junk[ts_at..ts_at + 4].copy_from_slice(&now_timestamp().to_be_bytes());
+            junk[len - 1] = hdr(marker, false);
+            assert_eq!(server.validate_and_strip(&mut junk, len, None), None);
+        }
+
         assert_eq!(
-            server.validate_and_strip(&mut envelope, len, None),
-            Some(DATAGRAM),
-            "the version 1 fallback did not rescue a packet that named version 2"
+            server.dh_count.load(Ordering::Relaxed) - before,
+            0,
+            "a caller who cannot produce a gate tag bought a curve operation"
         );
     }
 
-    /// The S8 finding, and the reason envelope v3 exists.
-    ///
-    /// Under load the server challenges before it knows who is calling, because
-    /// MAC1 is a Diffie-Hellman and there is nothing cheaper in front of it. So
-    /// a stranger — no key, no captured traffic — sends something Initial-shaped
-    /// with a plausible timestamp and gets a cookie reply, which is a server
-    /// that is supposed to be silent telling them it exists.
-    ///
-    /// With v3 the same stranger is dropped at MAC0, before the challenge.
+    /// A stranger — someone without the server's public key — cannot produce a
+    /// gate tag, so under load they are dropped rather than challenged. This is
+    /// the silence the gate exists for.
     #[tokio::test]
-    async fn under_load_a_stranger_is_not_challenged_on_version_3() {
-        let (server, _client) = pair_with(ENVELOPE_V3, vec![ENVELOPE_V3]).await;
-        let peer: SocketAddr = "127.0.0.1:40501".parse().unwrap();
+    async fn under_load_a_stranger_is_dropped_not_challenged() {
+        let (server, client) = pair().await;
         server.set_under_load(true);
+        let peer = client.io.local_addr().unwrap();
 
-        // Everything an attacker can produce without the server's public key:
-        // a real QUIC v1 header, a timestamp inside the window, and noise for
-        // the rest of the envelope.
-        let mut buf = quic_initial(1200);
-        buf.extend_from_slice(&[0x42u8; CLIENT_KEY_SIZE]);
-        buf.extend_from_slice(&[0u8; ED25519_SIZE]);
-        buf.extend_from_slice(&now_timestamp().to_be_bytes());
-        buf.extend_from_slice(&generate_nonce());
-        buf.extend_from_slice(&[0x11u8; MAC0_SIZE]); // guessed
-        buf.extend_from_slice(&[0x22u8; MAC_SIZE]);
-        buf.extend_from_slice(&[0x33u8; MAC2_SIZE]);
-        buf.push(ENVELOPE_V3);
-        let len = buf.len();
+        let mut env = client.build_initial(&initial(), None);
+        let len = env.len();
+        // A gate tag keyed on a server public key that is not this server's.
+        let stranger_key = crate::mac::gate_key(&[0x5A; 32]);
+        let covered_end = len - TRAILER_ANON + CLIENT_KEY_SIZE + TIMESTAMP_SIZE;
+        let forged = compute_gate(env[len - 1], &stranger_key, &env[..covered_end]);
+        env[covered_end..covered_end + GATE_SIZE].copy_from_slice(&forged);
 
-        assert_eq!(server.validate_and_strip(&mut buf, len, Some(peer)), None);
-        let stats = server.load_stats();
+        assert_eq!(server.validate_and_strip(&mut env, len, Some(peer)), None);
         assert_eq!(
-            stats.cookie_replies_sent, 0,
+            server.cookie_replies.load(Ordering::Relaxed),
+            0,
             "a stranger drew a cookie out of a server that is supposed to be silent"
         );
-        assert_eq!(stats.mac2_verified, 0);
     }
 
-    /// And the other half: a caller that *does* hold the server's public key is
-    /// still challenged, so the cookie defence keeps working for the people it
-    /// is meant to serve.
+    /// A caller who *does* hold the key is challenged rather than dropped:
+    /// the gate proves key knowledge, not that the address receives packets,
+    /// and only the cookie can prove the second.
     #[tokio::test]
-    async fn under_load_a_caller_who_knows_the_key_is_still_challenged() {
-        let (server, client) = pair_with(ENVELOPE_V3, vec![ENVELOPE_V3]).await;
-        let peer: SocketAddr = "127.0.0.1:40502".parse().unwrap();
+    async fn under_load_a_caller_who_knows_the_key_is_challenged() {
+        let (server, client) = pair().await;
         server.set_under_load(true);
+        let peer = client.io.local_addr().unwrap();
 
-        let mut envelope = client.build_initial(&initial(), None);
-        let len = envelope.len();
-        assert_eq!(server.validate_and_strip(&mut envelope, len, Some(peer)), None);
+        let mut env = client.build_initial(&initial(), None);
+        let len = env.len();
+        assert_eq!(server.validate_and_strip(&mut env, len, Some(peer)), None);
         assert_eq!(
-            server.load_stats().cookie_replies_sent, 1,
-            "a legitimate caller was not challenged, so it can never learn the cookie"
+            server.cookie_replies.load(Ordering::Relaxed),
+            1,
+            "a legitimate caller was not challenged"
         );
     }
 
-    /// A v3 envelope whose MAC0 does not verify is dropped even when the server
-    /// is not under load — the gate is unconditional, so rubbish costs one HMAC
-    /// rather than a curve operation.
+    /// The rule that must not soften. Under load the public-key form is not
+    /// enough, however well formed — accepting it would hand back an
+    /// unvalidated source address.
     #[tokio::test]
-    async fn a_bad_mac0_is_dropped_without_a_diffie_hellman() {
-        let (server, client) = pair_with(ENVELOPE_V3, vec![ENVELOPE_V3]).await;
-        let mut envelope = client.build_initial(&initial(), None);
-        // Corrupt MAC0, which sits just before MAC1 and MAC2 and the marker.
-        let mac0_at = envelope.len() - (MAC_SIZE + MAC2_SIZE + 1 + MAC0_SIZE);
-        envelope[mac0_at] ^= 0xFF;
-        let len = envelope.len();
-        assert_eq!(server.validate_and_strip(&mut envelope, len, None), None);
-    }
+    async fn under_load_the_public_key_gate_is_not_accepted() {
+        let (server, client) = pair().await;
+        let peer = client.io.local_addr().unwrap();
 
-    /// Version 3 round-trips: both ends agree on the trailer width, where MAC0
-    /// sits, and what it covers.
-    #[tokio::test]
-    async fn version_3_round_trips() {
-        let (server, client) = pair_with(ENVELOPE_V3, vec![ENVELOPE_V3]).await;
-        let mut envelope = client.build_initial(&initial(), None);
-        assert_eq!(envelope.len(), DATAGRAM + crate::mac::MAC_OVERHEAD_V3);
-        assert_eq!(*envelope.last().unwrap(), ENVELOPE_V3);
-        let len = envelope.len();
-        assert_eq!(
-            server.validate_and_strip(&mut envelope, len, None),
-            Some(DATAGRAM)
-        );
-    }
+        // Off load it verifies.
+        let mut env = client.build_initial(&initial(), None);
+        let len = env.len();
+        assert_eq!(server.validate_and_strip(&mut env, len, Some(peer)), Some(DATAGRAM));
 
-    /// One server serving all three at once, which is what makes the rollout
-    /// possible at all.
-    #[tokio::test]
-    async fn a_server_serves_all_three_versions() {
-        for version in [ENVELOPE_V1, ENVELOPE_V2, ENVELOPE_V3] {
-            let (server, client) =
-                pair_with(version, vec![ENVELOPE_V1, ENVELOPE_V2, ENVELOPE_V3]).await;
-            let mut envelope = client.build_initial(&initial(), None);
-            let len = envelope.len();
-            assert_eq!(
-                server.validate_and_strip(&mut envelope, len, None),
-                Some(DATAGRAM),
-                "server accepting all three refused version {version}"
-            );
-        }
-    }
-
-    /// The honest limit of this fix, pinned so nobody mistakes it for done: a
-    /// server that still accepts v1 or v2 keeps answering strangers on those
-    /// versions, because those envelopes have no MAC0 to check. S8 is closed
-    /// only when a deployment retires them.
-    #[tokio::test]
-    async fn a_v1_stranger_is_still_challenged_while_v1_is_accepted() {
-        let (server, _client) = pair_with(ENVELOPE_V1, vec![ENVELOPE_V1, ENVELOPE_V3]).await;
-        let peer: SocketAddr = "127.0.0.1:40503".parse().unwrap();
+        // The identical envelope, under load, must not.
         server.set_under_load(true);
-
-        let mut buf = quic_initial(1200);
-        buf.extend_from_slice(&[0x42u8; CLIENT_KEY_SIZE]);
-        buf.extend_from_slice(&[0u8; ED25519_SIZE]);
-        buf.extend_from_slice(&now_timestamp().to_be_bytes());
-        buf.extend_from_slice(&generate_nonce());
-        buf.extend_from_slice(&[0x22u8; MAC_SIZE]);
-        buf.extend_from_slice(&[0x33u8; MAC2_SIZE]);
-        let len = buf.len();
-
-        assert_eq!(server.validate_and_strip(&mut buf, len, Some(peer)), None);
+        let mut env = client.build_initial(&initial(), None);
         assert_eq!(
-            server.load_stats().cookie_replies_sent, 1,
-            "expected v1 to still leak a challenge — if this changed, update SIP-7 and the rollout note"
+            server.validate_and_strip(&mut env, len, Some(peer)),
+            None,
+            "the under-load path fell back to the public-key gate"
         );
     }
+
 
     /// Drive one pass of the client's receive path, so the cookie-reply
     /// handling in `poll_recv` is what the tests below exercise rather than a
@@ -1800,95 +1737,84 @@ mod tests {
         assert!(!same_peer(v4, "192.0.2.8:443".parse().unwrap()));
     }
 
-    /// The counter that turns retiring a version from nerve into arithmetic.
+    /// Accepted Initials are counted, and refused ones are not.
     ///
-    /// A server that drops an envelope does so in silence, so retiring one that
-    /// clients are still sending locks them out with nothing in any log on
-    /// either side. Before this there was no way to ask "is anything still
-    /// arriving on version 2" — the question the decision rests on.
+    /// With one version implemented the counter can no longer answer "is
+    /// anything still arriving on the old envelope" — the question it was built
+    /// for. It is kept for the next transition, and this pins the property that
+    /// made it trustworthy: a rejected Initial must never be counted as an
+    /// arrival on the version it claimed.
     #[tokio::test]
-    async fn accepted_initials_are_counted_per_envelope_version() {
-        let (server, _c) = pair_with(ENVELOPE_V1, vec![ENVELOPE_V1, ENVELOPE_V2, ENVELOPE_V3]).await;
+    async fn accepted_initials_are_counted_and_refused_ones_are_not() {
+        let (server, client) = pair().await;
 
-        let count = |s: &ServerSocket, v: u8| {
+        let count = |s: &ServerSocket| {
             s.load_stats()
                 .accepted_by_version
                 .iter()
-                .find(|(ver, _)| *ver == v)
+                .find(|(ver, _)| *ver == ENVELOPE_V4)
                 .map(|(_, n)| *n)
-                .expect("every known version is reported")
+                .expect("the implemented version is reported")
         };
 
-        for (version, times) in [(ENVELOPE_V1, 1), (ENVELOPE_V2, 3), (ENVELOPE_V3, 2)] {
-            let (_s, client) =
-                pair_with(version, vec![ENVELOPE_V1, ENVELOPE_V2, ENVELOPE_V3]).await;
-            for _ in 0..times {
-                let mut envelope = client.build_initial(&initial(), None);
-                let len = envelope.len();
-                // The client here was built against a different server, so its
-                // MAC1 will not verify — drive the counter through the server
-                // under test with its own client instead.
-                let _ = server.validate_and_strip(&mut envelope, len, None);
-            }
-        }
+        assert_eq!(count(&server), 0);
 
-        // Only the matched client's envelopes are accepted, so every count is
-        // zero — which is the point: a rejected Initial must not be counted as
-        // an arrival on its claimed version.
-        for v in [ENVELOPE_V1, ENVELOPE_V2, ENVELOPE_V3] {
-            assert_eq!(count(&server, v), 0, "a rejected envelope was counted");
-        }
-
-        // Now the real thing: one client that matches this server.
-        let (server, client) =
-            pair_with(ENVELOPE_V2, vec![ENVELOPE_V1, ENVELOPE_V2, ENVELOPE_V3]).await;
         for _ in 0..3 {
-            let mut envelope = client.build_initial(&initial(), None);
-            let len = envelope.len();
-            assert_eq!(server.validate_and_strip(&mut envelope, len, None), Some(DATAGRAM));
+            let mut env = client.build_initial(&initial(), None);
+            let len = env.len();
+            assert_eq!(server.validate_and_strip(&mut env, len, None), Some(DATAGRAM));
         }
-        assert_eq!(count(&server, ENVELOPE_V2), 3);
-        assert_eq!(count(&server, ENVELOPE_V1), 0);
-        assert_eq!(count(&server, ENVELOPE_V3), 0);
+        assert_eq!(count(&server), 3, "accepted Initials were not counted");
+
+        // A stranger's envelope: refused, and not counted.
+        let (_other, stranger) = pair().await;
+        let mut env = stranger.build_initial(&initial(), None);
+        let len = env.len();
+        assert_eq!(server.validate_and_strip(&mut env, len, None), None);
+        assert_eq!(count(&server), 3, "a refused Initial was counted as an arrival");
     }
 
+
     /// A deployment must be able to retire a version, or the oldest envelope
-    /// ever defined is a permanent floor.
+    /// ever defined is a permanent floor. Nothing here speaks anything but
+    /// version 4, so this asserts the mechanism rather than a transition.
     #[tokio::test]
-    async fn a_server_can_retire_version_1() {
-        let (server, client) = pair_with(ENVELOPE_V1, vec![ENVELOPE_V2]).await;
+    async fn a_server_accepting_nothing_this_client_speaks_refuses_it() {
+        let (server, client) = pair_with(ENVELOPE_V4, vec![]).await;
         let mut envelope = client.build_initial(&initial(), None);
         let len = envelope.len();
         assert_eq!(
             server.validate_and_strip(&mut envelope, len, None),
             None,
-            "a server that retired version 1 still accepted it"
+            "a server accepted a version it does not parse"
         );
     }
 
-    /// And a server that has not learned version 2 refuses it, which is the
-    /// direction that does not interoperate and the reason for servers-first.
+    /// The header is read before it is authenticated. Tampering with it must
+    /// cost a drop and never an accept: both tags cover it as a prefix, so a
+    /// flipped header is a tag over a layout the sender never used.
     #[tokio::test]
-    async fn a_version_1_server_refuses_version_2() {
-        let (server, client) = pair_with(ENVELOPE_V2, vec![ENVELOPE_V1]).await;
+    async fn a_flipped_header_is_dropped() {
+        // The identity flag, flipped on an envelope that carries no identity.
+        // It changes the trailer width the server computes, so this also pins
+        // that a header claiming more than the datagram holds is refused.
+        let (server, client) = pair().await;
         let mut envelope = client.build_initial(&initial(), None);
         let len = envelope.len();
-        assert_eq!(server.validate_and_strip(&mut envelope, len, None), None);
-    }
-
-    /// The marker is read before it is authenticated. Tampering with it must
-    /// cost a drop and never an accept: MAC1 covers it as a prefix, so a
-    /// flipped marker is a tag over a layout the sender never used.
-    #[tokio::test]
-    async fn a_flipped_marker_is_dropped() {
-        let (server, client) = pair_with(ENVELOPE_V2, vec![ENVELOPE_V1, ENVELOPE_V2]).await;
-        let mut envelope = client.build_initial(&initial(), None);
-        *envelope.last_mut().unwrap() = 7; // a version nobody defines
-        let len = envelope.len();
+        envelope[len - 1] = hdr(ENVELOPE_V4, true);
         assert_eq!(
             server.validate_and_strip(&mut envelope, len, None),
             None,
-            "an unknown marker was accepted"
+            "a flipped identity flag was accepted"
+        );
+
+        // And an undefined version in the high nibble.
+        let mut envelope = client.build_initial(&initial(), None);
+        envelope[len - 1] = hdr(7, false);
+        assert_eq!(
+            server.validate_and_strip(&mut envelope, len, None),
+            None,
+            "an unknown version was accepted"
         );
     }
 }

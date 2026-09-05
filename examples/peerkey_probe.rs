@@ -48,8 +48,8 @@ struct Args {
     /// a cookie before the Diffie-Hellman (SIP-7) — server mode.
     #[arg(long)]
     under_load: bool,
-    /// Envelope version to emit (SIP-29) — client mode. Servers accept both.
-    #[arg(long, default_value = "1")]
+    /// Envelope version to emit (SIP-29) — client mode.
+    #[arg(long, default_value = "4")]
     envelope_version: u8,
 }
 
