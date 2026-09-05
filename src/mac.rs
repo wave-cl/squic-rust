@@ -1,4 +1,4 @@
-use chacha20poly1305::{aead::Aead, aead::KeyInit as AeadKeyInit, XChaCha20Poly1305};
+use chacha20poly1305::{XChaCha20Poly1305, aead::Aead, aead::KeyInit as AeadKeyInit};
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 use std::net::IpAddr;
@@ -82,8 +82,7 @@ pub fn hdr_has_identity(hdr: u8) -> bool {
 }
 
 /// Trailer width for an anonymous caller: X25519, timestamp, gate, MAC1, header.
-pub const TRAILER_ANON: usize =
-    CLIENT_KEY_SIZE + TIMESTAMP_SIZE + GATE_SIZE + MAC_SIZE + HDR_SIZE;
+pub const TRAILER_ANON: usize = CLIENT_KEY_SIZE + TIMESTAMP_SIZE + GATE_SIZE + MAC_SIZE + HDR_SIZE;
 
 /// Trailer width when an identity is carried.
 pub const TRAILER_WITH_IDENTITY: usize = TRAILER_ANON + ED25519_SIZE;
@@ -91,8 +90,14 @@ pub const TRAILER_WITH_IDENTITY: usize = TRAILER_ANON + ED25519_SIZE;
 // The Initial send path bypasses quinn-udp because a 1200-byte QUIC datagram
 // plus this trailer exceeds the 1200-byte GSO segment size. These assertions
 // fail if the arithmetic behind that decision moves.
-const _: () = assert!(TRAILER_ANON == 69, "TRAILER_ANON changed — check the Initial send path in conn.rs");
-const _: () = assert!(TRAILER_WITH_IDENTITY == 101, "TRAILER_WITH_IDENTITY changed — check the Initial send path in conn.rs");
+const _: () = assert!(
+    TRAILER_ANON == 69,
+    "TRAILER_ANON changed — check the Initial send path in conn.rs"
+);
+const _: () = assert!(
+    TRAILER_WITH_IDENTITY == 101,
+    "TRAILER_WITH_IDENTITY changed — check the Initial send path in conn.rs"
+);
 
 /// The trailer width a header byte implies, or `None` if the version is unknown.
 ///
@@ -422,7 +427,10 @@ mod tests {
     #[test]
     fn trailer_width_follows_the_identity_flag() {
         assert_eq!(trailer_len(hdr(ENVELOPE_V4, false)), Some(TRAILER_ANON));
-        assert_eq!(trailer_len(hdr(ENVELOPE_V4, true)), Some(TRAILER_WITH_IDENTITY));
+        assert_eq!(
+            trailer_len(hdr(ENVELOPE_V4, true)),
+            Some(TRAILER_WITH_IDENTITY)
+        );
         assert_eq!(TRAILER_ANON, 69);
         assert_eq!(TRAILER_WITH_IDENTITY, 101);
         assert_eq!(TRAILER_WITH_IDENTITY - TRAILER_ANON, ED25519_SIZE);
@@ -438,8 +446,14 @@ mod tests {
     #[test]
     fn every_known_version_has_a_trailer() {
         for v in ENVELOPE_VERSIONS {
-            assert!(trailer_len(hdr(v, false)).is_some(), "version {v} has no width");
-            assert!(version_index(v).is_some(), "version {v} has no counter slot");
+            assert!(
+                trailer_len(hdr(v, false)).is_some(),
+                "version {v} has no width"
+            );
+            assert!(
+                version_index(v).is_some(),
+                "version {v} has no counter slot"
+            );
         }
     }
 
@@ -475,7 +489,10 @@ mod tests {
     fn test_is_quic_initial() {
         assert!(is_quic_initial(&[0xC0, 0, 0, 0, 1]));
         assert!(is_quic_initial(&[0xCF, 0, 0, 0, 1]));
-        assert!(!is_quic_initial(&[0xD0, 0, 0, 0, 1]), "0-RTT is not an Initial");
+        assert!(
+            !is_quic_initial(&[0xD0, 0, 0, 0, 1]),
+            "0-RTT is not an Initial"
+        );
         assert!(!is_quic_initial(&[0x40, 0, 0, 0, 1]), "short header");
         assert!(!is_quic_initial(&[0xC0]));
     }
@@ -484,8 +501,14 @@ mod tests {
     fn test_is_quic_zero_rtt() {
         assert!(is_quic_zero_rtt(&[0xD0, 0, 0, 0, 1]));
         assert!(is_quic_zero_rtt(&[0xDF, 0, 0, 0, 1]));
-        assert!(!is_quic_zero_rtt(&[0xC0, 0, 0, 0, 1]), "an Initial is not 0-RTT");
-        assert!(!is_quic_zero_rtt(&[0xE0, 0, 0, 0, 1]), "a Handshake is not 0-RTT");
+        assert!(
+            !is_quic_zero_rtt(&[0xC0, 0, 0, 0, 1]),
+            "an Initial is not 0-RTT"
+        );
+        assert!(
+            !is_quic_zero_rtt(&[0xE0, 0, 0, 0, 1]),
+            "a Handshake is not 0-RTT"
+        );
         assert!(!is_quic_zero_rtt(&[0x50, 0, 0, 0, 1]), "short header");
         assert!(!is_quic_zero_rtt(&[0xD0]));
     }

@@ -31,7 +31,9 @@ async fn test_client_server_connection() {
         let _ = send.stopped().await;
     });
 
-    let conn = squic::dial(addr, &pub_key, Config::default()).await.unwrap();
+    let conn = squic::dial(addr, &pub_key, Config::default())
+        .await
+        .unwrap();
     let (mut send, mut recv) = conn.open_bi().await.unwrap();
     send.write_all(b"hello squic").await.unwrap();
     send.finish().unwrap();
@@ -50,7 +52,10 @@ async fn test_silent_server_drops_invalid_mac() {
 
     // Send garbage to the server — should get no response
     let garbage_socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await.unwrap();
-    garbage_socket.send_to(b"garbage data that is not a valid QUIC packet", addr).await.unwrap();
+    garbage_socket
+        .send_to(b"garbage data that is not a valid QUIC packet", addr)
+        .await
+        .unwrap();
 
     // Send a fake QUIC Initial with wrong MAC
     let mut fake_initial = vec![0xC0u8; 200]; // looks like Initial
@@ -257,13 +262,12 @@ async fn test_no_stateless_reset_for_a_server_issued_cid() {
     let mut reply = [0u8; 2048];
     while tokio::time::Instant::now() < deadline {
         probe.send_to(&pkt, addr).await.unwrap();
-        if let Ok(Ok((n, _))) = tokio::time::timeout(
-            Duration::from_millis(200),
-            probe.recv_from(&mut reply),
-        )
-        .await
+        if let Ok(Ok((n, _))) =
+            tokio::time::timeout(Duration::from_millis(200), probe.recv_from(&mut reply)).await
         {
-            panic!("server answered a short header bearing one of its own retired CIDs with {n} bytes — that is a stateless reset, and it proves the server exists");
+            panic!(
+                "server answered a short header bearing one of its own retired CIDs with {n} bytes — that is a stateless reset, and it proves the server exists"
+            );
         }
     }
     drop(listener);
@@ -299,7 +303,9 @@ async fn test_whitelist_allows_known_client() {
         let _conn = incoming.await.unwrap();
     });
 
-    let conn = squic::dial(addr, &pub_key, Config::default()).await.unwrap();
+    let conn = squic::dial(addr, &pub_key, Config::default())
+        .await
+        .unwrap();
     drop(conn);
     let _ = server_task.await;
 }
@@ -495,7 +501,9 @@ async fn test_ipv6_connection() {
         let _ = send.stopped().await;
     });
 
-    let conn = squic::dial(addr, &pub_key, Config::default()).await.unwrap();
+    let conn = squic::dial(addr, &pub_key, Config::default())
+        .await
+        .unwrap();
     let (mut send, mut recv) = conn.open_bi().await.unwrap();
     send.write_all(b"hello over v6").await.unwrap();
     send.finish().unwrap();
@@ -559,7 +567,9 @@ async fn assert_handshake_survives_losing(lost: usize) {
     let server_addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         while let Some(incoming) = listener.accept().await {
-            tokio::spawn(async move { let _ = incoming.await; });
+            tokio::spawn(async move {
+                let _ = incoming.await;
+            });
         }
     });
 
@@ -631,7 +641,10 @@ async fn test_cookie_challenge_admits_a_legitimate_client() {
         conn.err()
     );
     let stats = listener.load_stats();
-    assert!(stats.cookie_replies_sent >= 1, "server never issued a challenge");
+    assert!(
+        stats.cookie_replies_sent >= 1,
+        "server never issued a challenge"
+    );
     assert!(
         stats.mac2_verified >= 1,
         "the client's MAC2 never verified — the exchange did not complete: {stats:?}"
@@ -670,7 +683,9 @@ async fn test_load_monitor_raises_and_clears_under_load() {
     // Four handshakes in well under a second, against a threshold of one DH
     // per second.
     for _ in 0..4 {
-        squic::dial(addr, &pub_key, Config::default()).await.unwrap();
+        squic::dial(addr, &pub_key, Config::default())
+            .await
+            .unwrap();
     }
 
     assert!(
@@ -705,7 +720,9 @@ async fn test_zero_load_threshold_disables_the_cookie_defence() {
     });
 
     for _ in 0..4 {
-        squic::dial(addr, &pub_key, Config::default()).await.unwrap();
+        squic::dial(addr, &pub_key, Config::default())
+            .await
+            .unwrap();
     }
     assert!(
         !wait_for_under_load(&listener, true).await,
@@ -722,7 +739,10 @@ async fn test_server_public_key_is_dialable() {
     // The accessor agrees with both the keypair it was built from and the
     // signing key's own verifying half.
     assert_eq!(listener.public_key(), pub_key);
-    assert_eq!(listener.public_key(), signing_key.verifying_key().to_bytes());
+    assert_eq!(
+        listener.public_key(),
+        signing_key.verifying_key().to_bytes()
+    );
 
     // The point of the accessor is that a caller need not have kept a copy, so
     // dial with the key the listener reports rather than the one we generated.
@@ -741,7 +761,9 @@ async fn test_server_public_key_is_dialable() {
         let _ = send.stopped().await;
     });
 
-    let conn = squic::dial(addr, &reported, Config::default()).await.unwrap();
+    let conn = squic::dial(addr, &reported, Config::default())
+        .await
+        .unwrap();
     let (mut send, mut recv) = conn.open_bi().await.unwrap();
     send.write_all(b"ping").await.unwrap();
     send.finish().unwrap();
@@ -795,7 +817,11 @@ async fn test_peer_key_matches_dialing_client() {
     let _ = r.read(&mut buf).await.unwrap().unwrap();
 
     let (seen, seen_again) = server.await.unwrap();
-    assert_eq!(seen, Some(expected), "peer key must match the dialing client");
+    assert_eq!(
+        seen,
+        Some(expected),
+        "peer key must match the dialing client"
+    );
     assert_eq!(seen_again, Some(expected), "peek must resolve repeatedly");
 }
 
@@ -840,7 +866,11 @@ async fn test_peer_identity_is_reported_when_advertised() {
 
     let (key, id) = server.await.unwrap();
     assert!(key.is_some(), "peer key must still be present");
-    assert_eq!(id, Some(expected_ed), "advertised Ed25519 identity reported at accept");
+    assert_eq!(
+        id,
+        Some(expected_ed),
+        "advertised Ed25519 identity reported at accept"
+    );
 }
 
 /// SIP-3 is opt-in: a client that does not advertise (the default) is anonymous
@@ -908,7 +938,9 @@ async fn test_peer_key_none_for_unknown_dcid() {
     });
 
     // No client_key => ephemeral random X25519 key.
-    let conn = squic::dial(addr, &server_pub, Config::default()).await.unwrap();
+    let conn = squic::dial(addr, &server_pub, Config::default())
+        .await
+        .unwrap();
     let (mut s, mut r) = conn.open_bi().await.unwrap();
     s.write_all(b"x").await.unwrap();
     s.finish().unwrap();
@@ -916,7 +948,10 @@ async fn test_peer_key_none_for_unknown_dcid() {
     let _ = r.read(&mut buf).await.unwrap().unwrap();
 
     let seen = server.await.unwrap();
-    assert!(seen.is_some(), "an ephemeral client still has a verified transport key");
+    assert!(
+        seen.is_some(),
+        "an ephemeral client still has a verified transport key"
+    );
 }
 
 /// The gate key a caller derives from the server's *published* Ed25519 key.
@@ -932,11 +967,7 @@ fn server_gate_key(server_ed_pub: &[u8; 32]) -> [u8; 32] {
 
 /// Build one Initial envelope by hand, the way a client would.
 /// Returns the datagram ready to put on the wire.
-fn forge_initial(
-    shared: &[u8; 32],
-    client_x25519_pub: &[u8; 32],
-    gate_key: &[u8],
-) -> Vec<u8> {
+fn forge_initial(shared: &[u8; 32], client_x25519_pub: &[u8; 32], gate_key: &[u8]) -> Vec<u8> {
     let datagram = {
         let mut d = vec![0u8; 1200];
         d[0] = 0xC0; // long header, fixed bit, Initial
@@ -1094,9 +1125,12 @@ async fn test_cookie_secret_rotation_keeps_one_generation_of_grace() {
     let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
     // Draw a challenge and keep the cookie.
-    sock.send_to(&forge_initial(&shared, &client_x_pub, &server_gate_key(&pk)), server_addr)
-        .await
-        .unwrap();
+    sock.send_to(
+        &forge_initial(&shared, &client_x_pub, &server_gate_key(&pk)),
+        server_addr,
+    )
+    .await
+    .unwrap();
     let mut reply = [0u8; 128];
     let (n, _) = tokio::time::timeout(Duration::from_secs(2), sock.recv_from(&mut reply))
         .await
@@ -1173,7 +1207,10 @@ async fn wait_for_mac2(listener: &squic::ServerListener, want: u64) -> u64 {
 fn the_only_version_is_four_and_it_is_the_default_on_both_sides() {
     let config = Config::default();
     assert_eq!(config.envelope_version, squic::mac::ENVELOPE_V4);
-    assert_eq!(config.accepted_envelope_versions, vec![squic::mac::ENVELOPE_V4]);
+    assert_eq!(
+        config.accepted_envelope_versions,
+        vec![squic::mac::ENVELOPE_V4]
+    );
     assert_eq!(squic::mac::ENVELOPE_VERSIONS, [squic::mac::ENVELOPE_V4]);
 }
 
@@ -1197,9 +1234,7 @@ fn the_only_version_is_four_and_it_is_the_default_on_both_sides() {
 async fn a_coalesced_burst_of_initials_is_still_accepted() {
     use quinn::udp::{Transmit, UdpSockRef, UdpSocketState};
     use squic::crypto::{ed25519_private_to_x25519, ed25519_public_to_x25519, x25519};
-    use squic::mac::{
-        ENVELOPE_V4, compute_gate, compute_mac1, gate_key, hdr, now_timestamp,
-    };
+    use squic::mac::{ENVELOPE_V4, compute_gate, compute_mac1, gate_key, hdr, now_timestamp};
     use std::net::UdpSocket;
 
     const BURST: usize = 4;
@@ -1384,7 +1419,10 @@ async fn listen_refuses_an_accept_set_this_build_cannot_parse() {
     let Err(err) = err else {
         panic!("listen bound on a partly-unparsable accept set");
     };
-    assert!(err.to_string().contains("accepted_envelope_versions"), "{err}");
+    assert!(
+        err.to_string().contains("accepted_envelope_versions"),
+        "{err}"
+    );
 
     // And empty, which names nothing unparsable and yet accepts nothing.
     let err = squic::listen(
@@ -1434,9 +1472,27 @@ async fn a_window_no_varint_can_carry_is_refused_not_truncated() {
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
     for (name, cfg) in [
-        ("stream_receive_window", Config { stream_receive_window: Some(u64::MAX), ..Default::default() }),
-        ("receive_window", Config { receive_window: Some(u64::MAX), ..Default::default() }),
-        ("max_incoming_streams", Config { max_incoming_streams: u64::MAX, ..Default::default() }),
+        (
+            "stream_receive_window",
+            Config {
+                stream_receive_window: Some(u64::MAX),
+                ..Default::default()
+            },
+        ),
+        (
+            "receive_window",
+            Config {
+                receive_window: Some(u64::MAX),
+                ..Default::default()
+            },
+        ),
+        (
+            "max_incoming_streams",
+            Config {
+                max_incoming_streams: u64::MAX,
+                ..Default::default()
+            },
+        ),
     ] {
         let err = match squic::listen(addr, &signing_key, cfg.clone()).await {
             Ok(_) => panic!("listen accepted {name} = u64::MAX"),
@@ -1473,7 +1529,9 @@ async fn a_window_no_varint_can_carry_is_refused_not_truncated() {
         send.finish().unwrap();
         tokio::time::sleep(Duration::from_millis(200)).await;
     });
-    let conn = squic::dial(addr, &pk, big).await.expect("dial with a large but valid window");
+    let conn = squic::dial(addr, &pk, big)
+        .await
+        .expect("dial with a large but valid window");
     let mut recv = conn.accept_uni().await.unwrap();
     assert_eq!(recv.read_to_end(64).await.unwrap(), b"through");
     conn.close(0u32.into(), b"");
@@ -1523,8 +1581,12 @@ async fn a_dial_can_be_pinned_to_a_local_port() {
     .unwrap();
 
     // Two ordinary dials, which get whatever the OS hands out.
-    let a = squic::dial(addr, &pub_key, Config::default()).await.unwrap();
-    let b = squic::dial(addr, &pub_key, Config::default()).await.unwrap();
+    let a = squic::dial(addr, &pub_key, Config::default())
+        .await
+        .unwrap();
+    let b = squic::dial(addr, &pub_key, Config::default())
+        .await
+        .unwrap();
 
     tokio::time::timeout(Duration::from_secs(5), async {
         while seen.lock().unwrap().len() < 3 {
@@ -1571,7 +1633,8 @@ async fn a_punch_is_sent_and_is_answered_by_nothing() {
     // A plain socket standing in for the peer, so the datagrams can be counted
     // rather than inferred.
     let peer = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-    peer.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+    peer.set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
     let peer_addr = peer.local_addr().unwrap();
 
     let (listener, _key, pub_key) = start_server(Config::default()).await;
@@ -1612,7 +1675,9 @@ async fn a_punch_is_sent_and_is_answered_by_nothing() {
     // And the other direction: a squic endpoint that receives one says nothing
     // back at all.
     let stranger = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-    stranger.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+    stranger
+        .set_read_timeout(Some(Duration::from_millis(300)))
+        .unwrap();
     stranger.send_to(&[0u8], addr).unwrap();
     let mut back = [0u8; 64];
     assert!(
@@ -1629,7 +1694,8 @@ async fn a_punch_is_sent_and_is_answered_by_nothing() {
 #[tokio::test]
 async fn a_listener_punches_as_well() {
     let peer = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-    peer.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+    peer.set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
     let peer_addr = peer.local_addr().unwrap();
 
     let (signing_key, _pub) = squic::generate_keypair();
@@ -1666,7 +1732,8 @@ async fn a_punch_list_is_bounded() {
     let mut targets = Vec::new();
     for _ in 0..(squic::MAX_PUNCH_TARGETS + 2) {
         let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        s.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+        s.set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
         targets.push(s.local_addr().unwrap());
         peers.push(s);
     }

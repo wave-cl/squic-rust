@@ -1,9 +1,9 @@
-use quinn::{Endpoint, ServerConfig, ClientConfig, TransportConfig, VarInt};
 use quinn::rustls;
 use quinn::rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
+use quinn::{ClientConfig, Endpoint, ServerConfig, TransportConfig, VarInt};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 #[tokio::main]
@@ -33,11 +33,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn get_arg<T: std::str::FromStr>(args: &[String], flag: &str) -> Option<T> {
-    args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)?.parse().ok())
+    args.iter()
+        .position(|a| a == flag)
+        .and_then(|i| args.get(i + 1)?.parse().ok())
 }
 
 fn get_arg_str(args: &[String], flag: &str) -> Option<String> {
-    args.iter().position(|a| a == flag).map(|i| args[i + 1].clone())
+    args.iter()
+        .position(|a| a == flag)
+        .map(|i| args[i + 1].clone())
 }
 
 fn generate_self_signed() -> (Vec<CertificateDer<'static>>, PrivatePkcs8KeyDer<'static>) {
@@ -162,22 +166,32 @@ async fn run_client(
         let (up, down) = tokio::join!(upload, download);
         let (up_bytes, up_secs) = up?;
         let (down_bytes, down_secs) = down?;
-        println!("[UP]   {} MB  {:.1} Mbits/sec  sender",
+        println!(
+            "[UP]   {} MB  {:.1} Mbits/sec  sender",
             up_bytes / 1_048_576,
-            up_bytes as f64 * 8.0 / up_secs / 1_000_000.0);
-        println!("[DOWN] {} MB  {:.1} Mbits/sec  receiver",
+            up_bytes as f64 * 8.0 / up_secs / 1_000_000.0
+        );
+        println!(
+            "[DOWN] {} MB  {:.1} Mbits/sec  receiver",
             down_bytes / 1_048_576,
-            down_bytes as f64 * 8.0 / down_secs / 1_000_000.0);
+            down_bytes as f64 * 8.0 / down_secs / 1_000_000.0
+        );
     } else if reverse {
         let (bytes, secs) = run_download(&conn, duration).await?;
-        println!("[SUM]  0.00-{:.2} sec  {} MB  {:.1} Mbits/sec  receiver",
-            secs, bytes / 1_048_576,
-            bytes as f64 * 8.0 / secs / 1_000_000.0);
+        println!(
+            "[SUM]  0.00-{:.2} sec  {} MB  {:.1} Mbits/sec  receiver",
+            secs,
+            bytes / 1_048_576,
+            bytes as f64 * 8.0 / secs / 1_000_000.0
+        );
     } else {
         let (bytes, secs) = run_upload(&conn, duration).await?;
-        println!("[SUM]  0.00-{:.2} sec  {} MB  {:.1} Mbits/sec  sender",
-            secs, bytes / 1_048_576,
-            bytes as f64 * 8.0 / secs / 1_000_000.0);
+        println!(
+            "[SUM]  0.00-{:.2} sec  {} MB  {:.1} Mbits/sec  sender",
+            secs,
+            bytes / 1_048_576,
+            bytes as f64 * 8.0 / secs / 1_000_000.0
+        );
     }
 
     Ok(())
@@ -206,8 +220,13 @@ async fn run_upload(
             last_total = t;
             let elapsed = start.elapsed().as_secs_f64();
             let mbps = delta as f64 * 8.0 / 1_000_000.0;
-            eprintln!("[  0]  {:.0}-{:.0}s  {} MB  {:.1} Mbits/sec  send",
-                elapsed - 1.0, elapsed, delta / 1_048_576, mbps);
+            eprintln!(
+                "[  0]  {:.0}-{:.0}s  {} MB  {:.1} Mbits/sec  send",
+                elapsed - 1.0,
+                elapsed,
+                delta / 1_048_576,
+                mbps
+            );
         }
     });
 
@@ -254,14 +273,21 @@ async fn run_download(
             last_total = t;
             let elapsed = start.elapsed().as_secs_f64();
             let mbps = delta as f64 * 8.0 / 1_000_000.0;
-            eprintln!("[  0]  {:.0}-{:.0}s  {} MB  {:.1} Mbits/sec  recv",
-                elapsed - 1.0, elapsed, delta / 1_048_576, mbps);
+            eprintln!(
+                "[  0]  {:.0}-{:.0}s  {} MB  {:.1} Mbits/sec  recv",
+                elapsed - 1.0,
+                elapsed,
+                delta / 1_048_576,
+                mbps
+            );
         }
     });
 
     while start.elapsed() < duration {
         match recv.read(&mut buf).await? {
-            Some(n) => { total.fetch_add(n as u64, Ordering::Relaxed); }
+            Some(n) => {
+                total.fetch_add(n as u64, Ordering::Relaxed);
+            }
             None => break,
         }
     }

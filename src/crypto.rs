@@ -77,10 +77,7 @@ pub fn ed25519_identity_to_x25519(ed_pub: &[u8; 32]) -> Result<X25519Public, cra
 /// A small-order peer key yields an all-zero shared secret regardless of our
 /// own key, which anyone can predict without knowing either party's public
 /// key. Returning it would let a MAC computed by a stranger verify.
-pub fn x25519(
-    secret: &X25519Secret,
-    public: &X25519Public,
-) -> Result<[u8; 32], crate::Error> {
+pub fn x25519(secret: &X25519Secret, public: &X25519Public) -> Result<[u8; 32], crate::Error> {
     let shared = secret.diffie_hellman(public);
     if !shared.was_contributory() {
         return Err(crate::Error::InvalidKey(

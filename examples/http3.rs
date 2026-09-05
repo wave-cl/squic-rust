@@ -59,10 +59,15 @@ async fn run_server(port: u16) -> Result<(), Box<dyn std::error::Error>> {
     println!("Server public key: {}", hex::encode(pub_key));
     println!("Listening on {} (HTTP/3)", addr);
 
-    let listener = squic::listen(addr, &signing_key, Config {
-        alpn_protocols: vec![b"h3".to_vec()],
-        ..Config::default()
-    }).await?;
+    let listener = squic::listen(
+        addr,
+        &signing_key,
+        Config {
+            alpn_protocols: vec![b"h3".to_vec()],
+            ..Config::default()
+        },
+    )
+    .await?;
 
     loop {
         let incoming = match listener.accept().await {
@@ -94,7 +99,10 @@ async fn handle_h3_connection(conn: quinn::Connection) -> Result<(), Box<dyn std
                 tokio::spawn(async move {
                     let (req, mut stream) = match resolver.resolve_request().await {
                         Ok(v) => v,
-                        Err(e) => { eprintln!("resolve error: {e}"); return; }
+                        Err(e) => {
+                            eprintln!("resolve error: {e}");
+                            return;
+                        }
                     };
 
                     let path = req.uri().path().to_string();
@@ -104,11 +112,7 @@ async fn handle_h3_connection(conn: quinn::Connection) -> Result<(), Box<dyn std
                             "application/json",
                             r#"{"status":"ok","protocol":"h3","server":"squic"}"#.to_string(),
                         ),
-                        _ => (
-                            200,
-                            "text/plain",
-                            "Hello from sQUIC HTTP/3!\n".to_string(),
-                        ),
+                        _ => (200, "text/plain", "Hello from sQUIC HTTP/3!\n".to_string()),
                     };
 
                     let resp = http::Response::builder()
@@ -152,10 +156,15 @@ async fn run_client(
 
     let addr: SocketAddr = format!("{}:{}", host, port).parse()?;
 
-    let conn = squic::dial(addr, &pub_key, Config {
-        alpn_protocols: vec![b"h3".to_vec()],
-        ..Config::default()
-    }).await?;
+    let conn = squic::dial(
+        addr,
+        &pub_key,
+        Config {
+            alpn_protocols: vec![b"h3".to_vec()],
+            ..Config::default()
+        },
+    )
+    .await?;
 
     let quinn_conn = h3_quinn::Connection::new(conn);
     let (mut driver, mut send_request) = h3::client::new(quinn_conn).await?;

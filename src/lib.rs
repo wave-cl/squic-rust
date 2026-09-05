@@ -537,7 +537,8 @@ fn build_transport_config(config: &Config) -> Result<quinn::TransportConfig, Err
     }
     match config.congestion_controller {
         CongestionController::Bbr => {
-            transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
+            transport
+                .congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
         }
         CongestionController::Cubic => {} // Quinn default
     }
@@ -594,9 +595,7 @@ pub async fn listen(
     }
 
     let server_x25519_priv = ed25519_private_to_x25519(signing_key);
-    let whitelist = Arc::new(Whitelist::new(
-        config.allowed_keys.as_deref(),
-    ));
+    let whitelist = Arc::new(Whitelist::new(config.allowed_keys.as_deref()));
 
     let std_socket = create_udp_socket(addr)?;
     // SIP-25: a listening peer punches too. Whichever side dials, both NATs
@@ -615,11 +614,12 @@ pub async fn listen(
     ServerSocket::spawn_maintenance(&server_socket);
 
     let tls_config = tls::server_tls_config(signing_key, &config.alpn_protocols)?;
-    let quic_server_config: quinn_proto::crypto::rustls::QuicServerConfig = tls_config
-        .try_into()
-        .map_err(|e: quinn_proto::crypto::rustls::NoInitialCipherSuite| {
-            crate::Error::Tls(format!("quic server config: {e}"))
-        })?;
+    let quic_server_config: quinn_proto::crypto::rustls::QuicServerConfig =
+        tls_config
+            .try_into()
+            .map_err(|e: quinn_proto::crypto::rustls::NoInitialCipherSuite| {
+                crate::Error::Tls(format!("quic server config: {e}"))
+            })?;
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_server_config));
     if config.disable_active_migration {
         server_config.migration(false);
@@ -663,14 +663,22 @@ pub async fn dial(
     let (client_x25519_priv, client_x25519_pub, client_ed25519_pub) =
         if let Some(ref key_hex) = config.client_key {
             // Persistent client identity: derive X25519 from Ed25519 seed
-            let seed = hex::decode(key_hex).map_err(|e| Error::Tls(format!("invalid client_key hex: {e}")))?;
+            let seed = hex::decode(key_hex)
+                .map_err(|e| Error::Tls(format!("invalid client_key hex: {e}")))?;
             if seed.len() != 32 {
-                return Err(Error::Tls(format!("client_key must be 32 bytes (got {})", seed.len())));
+                return Err(Error::Tls(format!(
+                    "client_key must be 32 bytes (got {})",
+                    seed.len()
+                )));
             }
             let signing_key = ed25519_dalek::SigningKey::from_bytes(&seed.try_into().unwrap());
             let x25519_priv = ed25519_private_to_x25519(&signing_key);
             let x25519_pub = X25519Public::from(&x25519_priv);
-            (x25519_priv, x25519_pub, Some(signing_key.verifying_key().to_bytes()))
+            (
+                x25519_priv,
+                x25519_pub,
+                Some(signing_key.verifying_key().to_bytes()),
+            )
         } else {
             // Ephemeral: random X25519 key pair, no Ed25519 identity to assert.
             let priv_key = x25519_dalek::StaticSecret::random_from_rng(rand_core::OsRng);
@@ -741,11 +749,12 @@ pub async fn dial(
     );
 
     let tls_config = tls::client_tls_config(server_pub_key, &config.alpn_protocols)?;
-    let quic_client_config: quinn_proto::crypto::rustls::QuicClientConfig = tls_config
-        .try_into()
-        .map_err(|e: quinn_proto::crypto::rustls::NoInitialCipherSuite| {
-            crate::Error::Tls(format!("quic client config: {e}"))
-        })?;
+    let quic_client_config: quinn_proto::crypto::rustls::QuicClientConfig =
+        tls_config
+            .try_into()
+            .map_err(|e: quinn_proto::crypto::rustls::NoInitialCipherSuite| {
+                crate::Error::Tls(format!("quic client config: {e}"))
+            })?;
     let mut client_config = quinn::ClientConfig::new(Arc::new(quic_client_config));
 
     let transport = build_transport_config(&config)?;
@@ -766,10 +775,12 @@ pub async fn dial(
     let connecting = endpoint.connect(addr, "squic")?;
     let conn = tokio::time::timeout(handshake_timeout, connecting)
         .await
-        .map_err(|_| Error::Io(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            format!("handshake timed out after {:?}", handshake_timeout),
-        )))??;
+        .map_err(|_| {
+            Error::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("handshake timed out after {:?}", handshake_timeout),
+            ))
+        })??;
     Ok(conn)
 }
 

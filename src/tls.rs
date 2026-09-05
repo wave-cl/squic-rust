@@ -235,10 +235,12 @@ mod tests {
             .distinguished_name
             .push(rcgen::DnType::CommonName, "squic");
         // An arbitrary private-enterprise OID; the content is what matters.
-        params.custom_extensions.push(rcgen::CustomExtension::from_oid_content(
-            &[1, 3, 6, 1, 4, 1, 99999, 1],
-            smuggled.to_vec(),
-        ));
+        params
+            .custom_extensions
+            .push(rcgen::CustomExtension::from_oid_content(
+                &[1, 3, 6, 1, 4, 1, 99999, 1],
+                smuggled.to_vec(),
+            ));
 
         let cert = params.self_signed(&key_pair).unwrap();
         CertificateDer::from(cert.der().to_vec())
@@ -301,9 +303,12 @@ mod tests {
         params
             .distinguished_name
             .push(rcgen::DnType::CommonName, "squic");
-        params.custom_extensions.push(
-            rcgen::CustomExtension::from_oid_content(&[1, 3, 6, 1, 4, 1, 99999, 1], pk.to_vec()),
-        );
+        params
+            .custom_extensions
+            .push(rcgen::CustomExtension::from_oid_content(
+                &[1, 3, 6, 1, 4, 1, 99999, 1],
+                pk.to_vec(),
+            ));
         let cert = params.self_signed(&key_pair).unwrap();
         let der = CertificateDer::from(cert.der().to_vec());
 

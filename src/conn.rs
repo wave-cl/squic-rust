@@ -1,3 +1,4 @@
+use crate::crypto::ed25519_identity_to_x25519;
 use crate::mac::{
     CLIENT_KEY_SIZE, COOKIE_REPLY_TYPE, COOKIE_SECRET_LIFETIME_SECS, ED25519_SIZE,
     ENVELOPE_VERSIONS, GATE_SIZE, MAC_SIZE, TIMESTAMP_SIZE, TRAILER_WITH_IDENTITY, compute_gate,
@@ -5,13 +6,12 @@ use crate::mac::{
     hdr_version, is_quic_initial, is_quic_zero_rtt, now_timestamp, timestamp_in_window,
     trailer_len, verify_gate, verify_mac1,
 };
-use crate::crypto::ed25519_identity_to_x25519;
 use crate::whitelist::Whitelist;
-use quinn::udp::{RecvMeta, Transmit, UdpSocketState};
 use quinn::AsyncUdpSocket;
+use quinn::udp::{RecvMeta, Transmit, UdpSocketState};
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
-use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::task::{Context, Poll};
@@ -156,9 +156,15 @@ impl PeerTable {
             inner.drop_front();
         }
 
-        inner
-            .map
-            .insert(dcid.to_vec(), PeerEntry { key, identity, inserted: now, poisoned: false });
+        inner.map.insert(
+            dcid.to_vec(),
+            PeerEntry {
+                key,
+                identity,
+                inserted: now,
+                poisoned: false,
+            },
+        );
         inner.order.push_back((now, dcid.to_vec()));
     }
 
@@ -384,7 +390,12 @@ impl ServerSocket {
     /// implemented, so the byte is read once and dispatched once. The guessing
     /// this replaced — try the marked version, then try unmarked version 1 —
     /// is what let a single datagram be parsed twice.
-    fn validate_and_strip(&self, buf: &mut [u8], len: usize, addr: Option<SocketAddr>) -> Option<usize> {
+    fn validate_and_strip(
+        &self,
+        buf: &mut [u8],
+        len: usize,
+        addr: Option<SocketAddr>,
+    ) -> Option<usize> {
         // SIP-6 asks for silence toward anyone who cannot authenticate, and
         // the envelope alone does not deliver it: a long header carrying a
         // version the QUIC stack does not know draws a Version Negotiation
@@ -397,7 +408,8 @@ impl ServerSocket {
         // break every connection at the second flight. Those are silent
         // already — quinn ignores a non-Initial long header for a connection
         // it does not know.
-        if is_long_header(&buf[..len]) && !long_header_version(&buf[..len]).is_some_and(version_is_supported)
+        if is_long_header(&buf[..len])
+            && !long_header_version(&buf[..len]).is_some_and(version_is_supported)
         {
             return None;
         }
@@ -636,7 +648,9 @@ impl ServerSocket {
     /// The MAC1-bound Ed25519 identity recorded for `dcid`, if the Initial
     /// carried one that forward-derived to the peer key (SIP-3).
     pub(crate) fn peer_identity(&self, dcid: &[u8]) -> Option<[u8; 32]> {
-        self.peer_table.get(dcid, Instant::now()).and_then(|(_, id)| id)
+        self.peer_table
+            .get(dcid, Instant::now())
+            .and_then(|(_, id)| id)
     }
 
     fn send_cookie_reply(&self, addr: SocketAddr) {
@@ -679,7 +693,8 @@ impl ServerSocket {
                 ticker.tick().await;
                 let Some(s) = weak.upgrade() else { return };
                 let count = s.dh_count.swap(0, Ordering::Relaxed);
-                s.under_load.store(count > s.load_threshold, Ordering::Relaxed);
+                s.under_load
+                    .store(count > s.load_threshold, Ordering::Relaxed);
             }
         });
 
@@ -707,7 +722,10 @@ impl ServerSocket {
             cookie_replies_sent: self.cookie_replies.load(Ordering::Relaxed),
             mac2_verified: self.mac2_verified.load(Ordering::Relaxed),
             accepted_by_version: std::array::from_fn(|i| {
-                (ENVELOPE_VERSIONS[i], self.accepted[i].load(Ordering::Relaxed))
+                (
+                    ENVELOPE_VERSIONS[i],
+                    self.accepted[i].load(Ordering::Relaxed),
+                )
             }),
         }
     }
@@ -1267,11 +1285,9 @@ mod tests {
         let n = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 server.send_cookie_reply(peer);
-                if let Ok(Ok((n, _))) = tokio::time::timeout(
-                    Duration::from_millis(50),
-                    client.io.recv_from(&mut reply),
-                )
-                .await
+                if let Ok(Ok((n, _))) =
+                    tokio::time::timeout(Duration::from_millis(50), client.io.recv_from(&mut reply))
+                        .await
                 {
                     return n;
                 }
@@ -1311,7 +1327,10 @@ mod tests {
         let mut envelope = client.build_initial(&datagram, None);
         let len = envelope.len();
 
-        assert_eq!(server.validate_and_strip(&mut envelope, len, Some(peer)), None);
+        assert_eq!(
+            server.validate_and_strip(&mut envelope, len, Some(peer)),
+            None
+        );
         let stats = server.load_stats();
         assert_eq!(stats.mac2_verified, 0);
         assert_eq!(stats.cookie_replies_sent, 1);
@@ -1332,7 +1351,10 @@ mod tests {
         let mut envelope = client.build_initial(&datagram, Some(&cookie));
         let len = envelope.len();
 
-        assert_eq!(server.validate_and_strip(&mut envelope, len, Some(used_by)), None);
+        assert_eq!(
+            server.validate_and_strip(&mut envelope, len, Some(used_by)),
+            None
+        );
         assert_eq!(server.load_stats().mac2_verified, 0);
     }
 
@@ -1400,9 +1422,11 @@ mod tests {
         let mut envelope = client.build_initial(&datagram, None);
         let len = envelope.len();
 
-        assert_eq!(server.validate_and_strip(&mut envelope, len, Some(peer)), Some(1200));
+        assert_eq!(
+            server.validate_and_strip(&mut envelope, len, Some(peer)),
+            Some(1200)
+        );
     }
-
 
     const DATAGRAM: usize = 1200;
 
@@ -1450,7 +1474,10 @@ mod tests {
     #[tokio::test]
     async fn an_anonymous_envelope_is_32_bytes_shorter_than_one_with_an_identity() {
         let (_s, anon) = pair().await;
-        assert_eq!(anon.build_initial(&initial(), None).len(), DATAGRAM + TRAILER_ANON);
+        assert_eq!(
+            anon.build_initial(&initial(), None).len(),
+            DATAGRAM + TRAILER_ANON
+        );
         assert_eq!(TRAILER_WITH_IDENTITY - TRAILER_ANON, ED25519_SIZE);
     }
 
@@ -1548,7 +1575,10 @@ mod tests {
         // Off load it verifies.
         let mut env = client.build_initial(&initial(), None);
         let len = env.len();
-        assert_eq!(server.validate_and_strip(&mut env, len, Some(peer)), Some(DATAGRAM));
+        assert_eq!(
+            server.validate_and_strip(&mut env, len, Some(peer)),
+            Some(DATAGRAM)
+        );
 
         // The identical envelope, under load, must not.
         server.set_under_load(true);
@@ -1559,7 +1589,6 @@ mod tests {
             "the under-load path fell back to the public-key gate"
         );
     }
-
 
     /// Drive one pass of the client's receive path, so the cookie-reply
     /// handling in `poll_recv` is what the tests below exercise rather than a
@@ -1587,11 +1616,8 @@ mod tests {
         // An Initial in flight, so a challenge would be answerable.
         client.io.writable().await.unwrap();
         client.send_initial(&initial(), server_addr).unwrap();
-        let _ = tokio::time::timeout(
-            Duration::from_millis(300),
-            server.io.recv_from(&mut junk),
-        )
-        .await;
+        let _ =
+            tokio::time::timeout(Duration::from_millis(300), server.io.recv_from(&mut junk)).await;
 
         let stranger = socket().await;
         let sealed = encrypt_cookie(&client.cookie_key, &[0x9Au8; 16]).unwrap();
@@ -1606,11 +1632,8 @@ mod tests {
             client.cookie.read().unwrap().is_none(),
             "a stranger set our cookie"
         );
-        let echoed = tokio::time::timeout(
-            Duration::from_millis(300),
-            server.io.recv_from(&mut junk),
-        )
-        .await;
+        let echoed =
+            tokio::time::timeout(Duration::from_millis(300), server.io.recv_from(&mut junk)).await;
         assert!(
             echoed.is_err(),
             "an injected cookie reply made the client shout at the server"
@@ -1630,11 +1653,8 @@ mod tests {
 
         client.io.writable().await.unwrap();
         client.send_initial(&initial(), server_addr).unwrap();
-        let _ = tokio::time::timeout(
-            Duration::from_millis(300),
-            server.io.recv_from(&mut junk),
-        )
-        .await;
+        let _ =
+            tokio::time::timeout(Duration::from_millis(300), server.io.recv_from(&mut junk)).await;
 
         for i in 0..10u8 {
             let sealed = encrypt_cookie(&client.cookie_key, &[i; 16]).unwrap();
@@ -1649,12 +1669,9 @@ mod tests {
         }
 
         let mut answers = 0;
-        while tokio::time::timeout(
-            Duration::from_millis(250),
-            server.io.recv_from(&mut junk),
-        )
-        .await
-        .is_ok()
+        while tokio::time::timeout(Duration::from_millis(250), server.io.recv_from(&mut junk))
+            .await
+            .is_ok()
         {
             answers += 1;
         }
@@ -1681,7 +1698,8 @@ mod tests {
         // First Initial, first reply: answered.
         client.io.writable().await.unwrap();
         client.send_initial(&initial(), server_addr).unwrap();
-        let _ = tokio::time::timeout(Duration::from_millis(300), server.io.recv_from(&mut junk)).await;
+        let _ =
+            tokio::time::timeout(Duration::from_millis(300), server.io.recv_from(&mut junk)).await;
         server.io.send_to(&reply, client_addr).await.unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
         client.io.writable().await.unwrap();
@@ -1697,7 +1715,8 @@ mod tests {
         // stands between a replayed reply and another Initial.
         client.io.writable().await.unwrap();
         client.send_initial(&initial(), server_addr).unwrap();
-        let _ = tokio::time::timeout(Duration::from_millis(300), server.io.recv_from(&mut junk)).await;
+        let _ =
+            tokio::time::timeout(Duration::from_millis(300), server.io.recv_from(&mut junk)).await;
         server.io.send_to(&reply, client_addr).await.unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
         client.io.writable().await.unwrap();
@@ -1780,7 +1799,10 @@ mod tests {
         for _ in 0..3 {
             let mut env = client.build_initial(&initial(), None);
             let len = env.len();
-            assert_eq!(server.validate_and_strip(&mut env, len, None), Some(DATAGRAM));
+            assert_eq!(
+                server.validate_and_strip(&mut env, len, None),
+                Some(DATAGRAM)
+            );
         }
         assert_eq!(count(&server), 3, "accepted Initials were not counted");
 
@@ -1789,9 +1811,12 @@ mod tests {
         let mut env = stranger.build_initial(&initial(), None);
         let len = env.len();
         assert_eq!(server.validate_and_strip(&mut env, len, None), None);
-        assert_eq!(count(&server), 3, "a refused Initial was counted as an arrival");
+        assert_eq!(
+            count(&server),
+            3,
+            "a refused Initial was counted as an arrival"
+        );
     }
-
 
     /// A deployment must be able to retire a version, or the oldest envelope
     /// ever defined is a permanent floor. Nothing here speaks anything but
