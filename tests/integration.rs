@@ -1479,3 +1479,218 @@ async fn a_window_no_varint_can_carry_is_refused_not_truncated() {
     conn.close(0u32.into(), b"");
     let _ = server.await;
 }
+
+/// SIP-25: a client can be told which local port to dial from, which is the
+/// thing hole punching turns on — a NAT maps an internal `ip:port` to an
+/// external one, and a peer is reachable only through the mapping that made it.
+///
+/// The negative half is in the same test and is the point: the *default* dial
+/// gets a fresh port every time, which is what makes an ordinary dial useless
+/// for punching.
+#[tokio::test]
+async fn a_dial_can_be_pinned_to_a_local_port() {
+    let (listener, _key, pub_key) = start_server(Config::default()).await;
+    let addr = listener.local_addr().unwrap();
+    let seen: Arc<Mutex<Vec<SocketAddr>>> = Arc::new(Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&seen);
+    let accepting = tokio::spawn(async move {
+        for _ in 0..3 {
+            let Some(incoming) = listener.accept().await else {
+                break;
+            };
+            if let Ok(conn) = incoming.await {
+                recorded.lock().unwrap().push(conn.remote_address());
+            }
+        }
+    });
+
+    // A port this test owns: bound, read back, released. Racy in principle and
+    // fine here — the point is that squic uses what it is given, not that the
+    // port is reserved.
+    let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let chosen = probe.local_addr().unwrap();
+    drop(probe);
+
+    let conn = squic::dial(
+        addr,
+        &pub_key,
+        Config {
+            local_bind: Some(chosen),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    // Two ordinary dials, which get whatever the OS hands out.
+    let a = squic::dial(addr, &pub_key, Config::default()).await.unwrap();
+    let b = squic::dial(addr, &pub_key, Config::default()).await.unwrap();
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while seen.lock().unwrap().len() < 3 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the server did not accept three connections");
+
+    // **What the server saw is the assertion.** The mapping a peer would have
+    // to be told about is the source port, and for the pinned dial it is the
+    // one asked for.
+    let observed = seen.lock().unwrap().clone();
+    assert!(
+        observed.iter().any(|o| o.port() == chosen.port()),
+        "the pinned dial did not arrive from the port it was given: {observed:?}"
+    );
+
+    // And the negative half, which is why an ordinary dial cannot be punched
+    // through: the other two came from two different, unasked-for ports.
+    let ephemeral: Vec<u16> = observed
+        .iter()
+        .map(|o| o.port())
+        .filter(|p| *p != chosen.port())
+        .collect();
+    assert_eq!(ephemeral.len(), 2);
+    assert_ne!(
+        ephemeral[0], ephemeral[1],
+        "two default dials shared a port, which they must not"
+    );
+
+    drop((conn, a, b));
+    accepting.abort();
+}
+
+/// The punch datagrams go out, and are **dropped in silence** by whatever
+/// receives them — one byte, a short header for a connection nobody has.
+///
+/// A squic endpoint on the other end must not answer: a reply would be a reply
+/// to a caller that has proved nothing, which is the property the silent server
+/// exists for.
+#[tokio::test]
+async fn a_punch_is_sent_and_is_answered_by_nothing() {
+    // A plain socket standing in for the peer, so the datagrams can be counted
+    // rather than inferred.
+    let peer = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    peer.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+    let peer_addr = peer.local_addr().unwrap();
+
+    let (listener, _key, pub_key) = start_server(Config::default()).await;
+    let addr = listener.local_addr().unwrap();
+    let accepting = tokio::spawn(async move {
+        if let Some(incoming) = listener.accept().await {
+            let _ = incoming.await;
+        }
+    });
+
+    let conn = squic::dial(
+        addr,
+        &pub_key,
+        Config {
+            punch: vec![peer_addr],
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let mut seen = 0;
+    let mut buf = [0u8; 64];
+    while let Ok((n, _from)) = peer.recv_from(&mut buf) {
+        assert_eq!(n, 1, "a punch is one byte");
+        assert_eq!(buf[0], 0x00, "a punch must not look like anything");
+        seen += 1;
+        if seen == squic::PUNCH_DATAGRAMS {
+            break;
+        }
+    }
+    assert_eq!(
+        seen,
+        squic::PUNCH_DATAGRAMS,
+        "the punch datagrams did not arrive"
+    );
+
+    // And the other direction: a squic endpoint that receives one says nothing
+    // back at all.
+    let stranger = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    stranger.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+    stranger.send_to(&[0u8], addr).unwrap();
+    let mut back = [0u8; 64];
+    assert!(
+        stranger.recv_from(&mut back).is_err(),
+        "a squic endpoint answered a punch, which a silent server must never do"
+    );
+
+    drop(conn);
+    accepting.abort();
+}
+
+/// A listening peer punches too. Whichever side dials, both NATs have to be
+/// opened, and only an outbound packet opens one.
+#[tokio::test]
+async fn a_listener_punches_as_well() {
+    let peer = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    peer.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+    let peer_addr = peer.local_addr().unwrap();
+
+    let (signing_key, _pub) = squic::generate_keypair();
+    let listener = squic::listen(
+        "127.0.0.1:0".parse().unwrap(),
+        &signing_key,
+        Config {
+            punch: vec![peer_addr],
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let mut seen = 0;
+    let mut buf = [0u8; 64];
+    while let Ok((n, _)) = peer.recv_from(&mut buf) {
+        assert_eq!(n, 1);
+        seen += 1;
+        if seen == squic::PUNCH_DATAGRAMS {
+            break;
+        }
+    }
+    assert_eq!(seen, squic::PUNCH_DATAGRAMS, "a listener did not punch");
+    drop(listener);
+}
+
+/// The send primitive is bounded, because it takes a destination from its
+/// caller and that is the shape a reflection abuse takes. It amplifies nothing
+/// — one byte out per byte asked for — and it will not be pointed at a list.
+#[tokio::test]
+async fn a_punch_list_is_bounded() {
+    let mut peers = Vec::new();
+    let mut targets = Vec::new();
+    for _ in 0..(squic::MAX_PUNCH_TARGETS + 2) {
+        let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        s.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+        targets.push(s.local_addr().unwrap());
+        peers.push(s);
+    }
+
+    let (signing_key, _pub) = squic::generate_keypair();
+    let listener = squic::listen(
+        "127.0.0.1:0".parse().unwrap(),
+        &signing_key,
+        Config {
+            punch: targets,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let mut buf = [0u8; 64];
+    for (i, s) in peers.iter().enumerate() {
+        let got = s.recv_from(&mut buf).is_ok();
+        if i < squic::MAX_PUNCH_TARGETS {
+            assert!(got, "target {i} was inside the cap and got nothing");
+        } else {
+            assert!(!got, "target {i} was past the cap and was punched anyway");
+        }
+    }
+    drop(listener);
+}

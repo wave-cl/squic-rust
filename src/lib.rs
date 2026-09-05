@@ -15,6 +15,24 @@ use x25519_dalek::PublicKey as X25519Public;
 
 /// Create a UDP socket with 2MB send/recv buffers for high-throughput QUIC.
 /// Linux defaults to ~160KB which causes ACK loss at high data rates.
+/// Open the NAT mapping for each peer, so its packets are not dropped on the way
+/// in.
+///
+/// One byte, `0x00`: a short-header packet for a connection nobody has, which
+/// every squic endpoint discards in silence — and never answers, because a
+/// stateless reset would be a reply to a caller that has proved nothing.
+///
+/// Errors are ignored on purpose. A punch that does not leave is a punch that
+/// did not work, and there is nothing to report to a caller who will find that
+/// out when the connection does not form.
+fn punch(sock: &std::net::UdpSocket, targets: &[SocketAddr]) {
+    for target in targets.iter().take(MAX_PUNCH_TARGETS) {
+        for _ in 0..PUNCH_DATAGRAMS {
+            let _ = sock.send_to(&[0u8], target);
+        }
+    }
+}
+
 fn create_udp_socket(addr: SocketAddr) -> std::result::Result<std::net::UdpSocket, Error> {
     let domain = if addr.is_ipv6() {
         socket2::Domain::IPV6
@@ -165,6 +183,12 @@ pub enum CongestionController {
 /// auto-tuning rather than pin the window, which only quic-go can do, a Go
 /// caller uses `QuicConfig`.
 ///
+/// **Same in both, with the types each language prefers.** `local_bind` and
+/// `punch` pair with Go's `LocalBind` and `Punch`. They are `SocketAddr` here
+/// and `string` there, because that is what each side's own `dial` and `listen`
+/// already take — a caller in either language passes what it would have passed
+/// anyway, and neither has to learn the other's address type.
+///
 /// `Clone` because Go's `Config` is a plain struct a caller can copy, and one
 /// config is often wanted for both a `listen` and a `dial` — `listen` takes it
 /// by value, so without this the caller has to build it twice.
@@ -235,7 +259,52 @@ pub struct Config {
     /// survives for the next transition; what does not survive is a default
     /// that admits a weaker version than the one the client sends.
     pub accepted_envelope_versions: Vec<u8>,
+
+    /// SIP-25: the local address [`dial`] binds, instead of an ephemeral port.
+    ///
+    /// **This exists for hole punching and for nothing else.** A NAT maps an
+    /// internal `ip:port` to an external one, and a peer can only be reached
+    /// through the mapping the exchange observed — which means dialling *from*
+    /// the port that made it. `dial` otherwise binds `:0` and gets a fresh
+    /// port, and therefore a fresh mapping the peer has never seen.
+    ///
+    /// `None` — the default, and what every ordinary caller wants — binds an
+    /// ephemeral port. Pinning one costs you the ability to have two dials in
+    /// flight at once, and gains nothing unless something else is holding the
+    /// mapping open.
+    ///
+    /// Ignored by [`listen`], which already takes the address it binds.
+    pub local_bind: Option<SocketAddr>,
+
+    /// SIP-25: addresses to send a punch datagram to, right after binding.
+    ///
+    /// A NAT will not deliver an inbound packet until something has gone out to
+    /// that peer, so both sides send first and each one's outbound opens its own
+    /// mapping. The datagram is one byte and is meant to be **dropped**: a
+    /// short-header packet for a connection nobody has, which every squic
+    /// endpoint discards in silence and never answers — a stateless reset here
+    /// would be a reply to a caller that has proved nothing.
+    ///
+    /// **This is a send primitive with a caller-supplied destination**, which is
+    /// the shape a reflection abuse takes, so it is bounded: at most
+    /// [`MAX_PUNCH_TARGETS`] addresses, [`PUNCH_DATAGRAMS`] one-byte datagrams
+    /// each. It amplifies nothing — one byte out per byte asked for — and the
+    /// caller is the local application, which could send these itself.
+    ///
+    /// SIP-25 requires that an address reach a peer only after *both* sides
+    /// asked an exchange to be introduced. Nothing here can enforce that; the
+    /// transport takes an address and sends to it.
+    pub punch: Vec<SocketAddr>,
 }
+
+/// Addresses one [`Config::punch`] may name.
+pub const MAX_PUNCH_TARGETS: usize = 4;
+/// Datagrams sent to each punch target.
+///
+/// More than one because the first may cross the peer's on the way and find its
+/// NAT still shut; few, because this is unsolicited traffic to an address a
+/// caller named.
+pub const PUNCH_DATAGRAMS: usize = 3;
 
 impl Default for Config {
     fn default() -> Self {
@@ -260,6 +329,8 @@ impl Default for Config {
             load_threshold: None,
             envelope_version: crate::mac::ENVELOPE_V4,
             accepted_envelope_versions: vec![crate::mac::ENVELOPE_V4],
+            local_bind: None,
+            punch: Vec::new(),
         }
     }
 }
@@ -528,6 +599,9 @@ pub async fn listen(
     ));
 
     let std_socket = create_udp_socket(addr)?;
+    // SIP-25: a listening peer punches too. Whichever side dials, both NATs
+    // have to be opened, and only an outbound packet opens one.
+    punch(&std_socket, &config.punch);
     let socket = Arc::new(tokio::net::UdpSocket::from_std(std_socket).map_err(Error::Io)?);
 
     let load_threshold = config.load_threshold.unwrap_or(1000);
@@ -633,12 +707,22 @@ pub async fn dial(
         )));
     }
 
-    let bind_addr = if addr.is_ipv6() {
-        SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0))
-    } else {
-        SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
+    // Bind in the same family as the peer. Quinn refuses a remote whose
+    // address family does not match its endpoint, so a socket bound to
+    // 0.0.0.0 cannot dial an IPv6 server at all.
+    //
+    // A caller pinning a local address (SIP-25) is taken at its word, and gets
+    // the family it asked for — mismatching the peer is then its own error and
+    // is reported as quinn's, which names it.
+    let bind_addr = match config.local_bind {
+        Some(bound) => bound,
+        None if addr.is_ipv6() => SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)),
+        None => SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
     };
     let std_socket = create_udp_socket(bind_addr)?;
+    // Before quinn owns the socket: the mapping has to exist before the
+    // handshake starts, and this is the only moment the raw socket is in hand.
+    punch(&std_socket, &config.punch);
     let socket = Arc::new(tokio::net::UdpSocket::from_std(std_socket).map_err(Error::Io)?);
 
     let cookie_key = crate::mac::cookie_key(server_x25519_pub.as_bytes());
