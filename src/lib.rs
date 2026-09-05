@@ -434,7 +434,8 @@ pub async fn listen(
     // read at start, and a version arrives with the code that parses it.
     if config.accepted_envelope_versions.is_empty() {
         return Err(Error::Tls(
-            "accepted_envelope_versions is empty; a server that accepts no envelope version              binds successfully and then drops every Initial in silence"
+            "accepted_envelope_versions is empty; a server that accepts no envelope \
+             version binds successfully and then drops every Initial in silence"
                 .into(),
         ));
     }
@@ -446,7 +447,10 @@ pub async fn listen(
         .collect();
     if !unparsable.is_empty() {
         return Err(Error::Tls(format!(
-            "accepted_envelope_versions names {unparsable:?}, which this build cannot parse              (it implements {:?}); a server accepting only versions it cannot parse binds              successfully and then drops every Initial in silence",
+            "accepted_envelope_versions names {unparsable:?}, which this build \
+             cannot parse (it implements {:?}); a server accepting only versions \
+             it cannot parse binds successfully and then drops every Initial \
+             in silence",
             crate::mac::ENVELOPE_VERSIONS
         )));
     }

@@ -262,9 +262,11 @@ pub struct ServerSocket {
     inner: UdpSocketState,
     server_x25519_priv: X25519Secret,
     whitelist: Arc<Whitelist>,
-    /// Keys MAC0 (envelope v3), derived from our own public key.
+    /// Keys the gate tag when the caller holds no cookie (SIP-37 as merged
+    /// into envelope v4); derived from our own public key.
     gate_key: [u8; 32],
-    // MAC2 + cookie DDoS protection
+    // Cookie DDoS protection (SIP-7). A caller holding a cookie keys the
+    // gate tag with it instead.
     cookie_key: [u8; 32],
     cookie_secret: RwLock<[u8; 32]>,
     prev_cookie_secret: RwLock<[u8; 32]>,
