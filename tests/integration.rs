@@ -1292,3 +1292,46 @@ async fn a_coalesced_burst_of_initials_is_still_accepted() {
          silence"
     );
 }
+
+/// A client configured with a version this build cannot emit is refused at
+/// `dial`, not left to time out.
+///
+/// The server drops an envelope it does not parse in silence — by design — so
+/// without this a misconfigured client and an unreachable host produce the same
+/// symptom: a handshake timeout and nothing else. squic-go has refused this at
+/// Dial since S11; the Rust side never panicked the way Go's did, and so never
+/// grew the guard until the envelope v4 work went looking for it.
+#[tokio::test]
+async fn dial_refuses_an_envelope_version_this_build_cannot_emit() {
+    let (listener, _sk, pk) = start_server(Config::default()).await;
+    let addr = listener.local_addr().unwrap();
+
+    for bad in [0u8, 1, 2, 3, 5, 255] {
+        let err = squic::dial(
+            addr,
+            &pk,
+            Config {
+                envelope_version: bad,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("dial accepted a version it cannot emit");
+        assert!(
+            err.to_string().contains("envelope_version"),
+            "version {bad} was refused for the wrong reason: {err}"
+        );
+    }
+
+    // And the version it can emit gets past the guard. Nothing here is
+    // accepting, so the dial still fails — but it fails as a timeout, which is
+    // the point: the guard is what separates "you configured a version that
+    // does not exist" from "the server did not answer".
+    let err = squic::dial(addr, &pk, Config::default())
+        .await
+        .expect_err("nothing is accepting, so this cannot succeed");
+    assert!(
+        !err.to_string().contains("envelope_version"),
+        "the implemented version was refused by the guard: {err}"
+    );
+}

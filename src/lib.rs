@@ -505,6 +505,20 @@ pub async fn dial(
     // address family does not match its endpoint, so a socket bound to
     // 0.0.0.0 cannot dial an IPv6 server at all — it fails with "invalid
     // remote address" before a packet is sent.
+    // Refuse a version this build cannot emit, here, where the caller can see
+    // it. A client that sends an envelope no server parses gets a handshake
+    // timeout and nothing else — the server drops it in silence, by design —
+    // so a misconfiguration and an unreachable host look identical. squic-go
+    // has refused this at Dial since S11; this is the Rust half, which never
+    // panicked the way Go's did and so never grew the guard.
+    if crate::mac::trailer_len(crate::mac::hdr(config.envelope_version, false)).is_none() {
+        return Err(Error::Tls(format!(
+            "unknown envelope_version {} (this build emits {})",
+            config.envelope_version,
+            crate::mac::ENVELOPE_V4
+        )));
+    }
+
     let bind_addr = if addr.is_ipv6() {
         SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0))
     } else {
