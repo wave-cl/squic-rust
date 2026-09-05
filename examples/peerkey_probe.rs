@@ -18,6 +18,16 @@
 //! A harness runs this against the Go probe in every client/server combination
 //! and asserts every PEERKEY equals every CLIENTX, and every PEERID equals
 //! every CLIENTED (which covers both the advertised and the anonymous case).
+//!
+//! Both modes must end the exchange rather than leave it to time out, and the
+//! harnesses (`cross_peerkey_test.sh` and `cross_cookie_test.sh` in squic-go)
+//! run the client in the foreground, so a probe that lingers is charged to
+//! every row. The client bounds its read of the reply and closes the
+//! connection; the server flushes its reply before returning. Drop either and
+//! the peer waits out `max_idle_timeout` — 30 seconds a row, which took the
+//! peer-key matrix from 2 seconds to 2m03s. The symptom misleads, too: the
+//! delay lands on whichever side is waiting, not the side that left without
+//! saying goodbye.
 use clap::Parser;
 use squic::{self, Config};
 use std::net::SocketAddr;
