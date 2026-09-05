@@ -8,6 +8,39 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      # No cache and no dependency fetch: rustfmt parses rather than compiles
+      # and `cargo metadata --no-deps` resolves nothing.
+      #
+      # This crate is a single package with no path dependencies, so `--all`
+      # and the scoped form are the same thing here today. The scoped form is
+      # used anyway, and this repository is the reason the rest of the estate
+      # uses it: `cargo fmt --all` formats the workspace *and the path-based
+      # dependencies of its members*, and bti and oxwrt both consume squic by
+      # path. A `--all` run from either of them writes 84 sites into this
+      # checkout — which is where the 84 sites this commit series just fixed
+      # came from being visible in the first place.
+      #
+      # The package list is derived rather than written out, so a second crate
+      # added here cannot go silently unchecked, and is echoed so a green run
+      # shows what it covered.
+      - name: Format
+        run: |
+          args=()
+          while read -r n; do args+=(-p "$n"); done \
+            < <(cargo metadata --no-deps --format-version 1 | jq -r '.packages[].name')
+          test ${#args[@]} -gt 0
+          echo "checking: ${args[*]}"
+          cargo fmt "${args[@]}" -- --check
+
   test:
     runs-on: ubuntu-latest
     steps:
