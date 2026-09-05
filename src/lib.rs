@@ -129,6 +129,46 @@ pub enum CongestionController {
 }
 
 /// Configuration for sQUIC connections.
+///
+/// # Parity with squic-go
+///
+/// The two implementations share a wire format, not a config surface, and the
+/// gaps below are not oversights — they are places where quinn and quic-go
+/// disagree about what is tunable. Recorded here because a caller who reads one
+/// API and assumes the other is wrong without being told.
+///
+/// **No Go equivalent, and none can be added.** quic-go's `Config` has no field
+/// for any of these, so a mirrored field could only be accepted and discarded —
+/// which is worse than its absence, because a setting that is read and never
+/// applied looks like it works:
+///
+/// | Rust | why Go has none |
+/// |---|---|
+/// | `send_window` | quic-go exposes no send window |
+/// | `initial_rtt` | quic-go exposes no initial RTT |
+/// | `congestion_controller` | quic-go does not let you choose one |
+/// | `disable_active_migration` | quic-go exposes no migration control |
+///
+/// **No Rust equivalent.** Go has `QuicConfig`, a `*quic.Config` that replaces
+/// everything else wholesale. quinn's `TransportConfig` is built here rather
+/// than accepted from the caller, so there is no equivalent hatch; the fields
+/// on this struct are the whole surface.
+///
+/// **Same concept, same meaning, different defaults.** `stream_receive_window`
+/// and `receive_window` pair with Go's `StreamReceiveWindow` and
+/// `ReceiveWindow`. They did not always: Go's were `MaxStreamReceiveWindow` and
+/// `MaxConnectionReceiveWindow`, and set only quic-go's auto-tuning ceiling, so
+/// one name meant a fixed window here and a cap there. Setting either now pins
+/// the window in both. What still differs is the value you get by leaving them
+/// unset — quinn does not auto-tune, so this side is fixed at 1 MB and 10 MB,
+/// while quic-go starts there and tunes up to 6 MB and 15 MB. To cap
+/// auto-tuning rather than pin the window, which only quic-go can do, a Go
+/// caller uses `QuicConfig`.
+///
+/// `Clone` because Go's `Config` is a plain struct a caller can copy, and one
+/// config is often wanted for both a `listen` and a `dial` — `listen` takes it
+/// by value, so without this the caller has to build it twice.
+#[derive(Debug, Clone)]
 pub struct Config {
     /// Maximum idle timeout. Default: 30 seconds.
     pub max_idle_timeout: Duration,
@@ -231,11 +271,11 @@ impl Default for Config {
 /// every new client an extra round trip.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LoadStats {
-    /// Whether the server is currently demanding a valid MAC2.
+    /// Whether the server is currently demanding a cookie-keyed gate tag.
     pub under_load: bool,
     /// Cookie challenges issued since start.
     pub cookie_replies_sent: u64,
-    /// Initial packets accepted on a valid MAC2 since start.
+    /// Initial packets accepted on a cookie-keyed gate tag since start.
     pub mac2_verified: u64,
     /// Initials accepted, per envelope version, as `(version, count)`.
     ///
@@ -371,15 +411,42 @@ impl ServerListener {
     }
 }
 
-fn build_transport_config(config: &Config) -> quinn::TransportConfig {
+/// A `u64` config value as a QUIC varint, or an error naming the field.
+///
+/// These fields are `u64` and QUIC varints top out at 2^62 - 1. They used to be
+/// cast `as u32`, which silently wrapped anything from 4 GiB up — a caller
+/// asking for a larger window got a *smaller* one than the default, with
+/// nothing said.
+///
+/// Refusing rather than clamping, and that was measured, not assumed. Clamping
+/// to `VarInt::MAX` was the first fix and it is worse than the bug: every field
+/// binds happily at that value, and the process then grows without bound the
+/// moment a stream carries data, because quinn sizes buffers from the window.
+/// A config value that cannot be honoured should stop the caller, not be
+/// rewritten into one that looks fine until traffic arrives.
+///
+/// A value that *fits* is passed through as given, however large. That is
+/// quinn's business, and quietly rewriting a caller's number is the habit this
+/// function exists to break.
+fn varint(field: &str, value: u64) -> Result<quinn::VarInt, Error> {
+    quinn::VarInt::from_u64(value).map_err(|_| {
+        Error::Tls(format!(
+            "{field} is {value}, which no QUIC varint can carry (the ceiling is \
+             {}); it would have been silently truncated",
+            quinn::VarInt::MAX
+        ))
+    })
+}
+
+fn build_transport_config(config: &Config) -> Result<quinn::TransportConfig, Error> {
     let mut transport = quinn::TransportConfig::default();
     transport.max_idle_timeout(Some(config.max_idle_timeout.try_into().unwrap()));
 
     let stream_window = config.stream_receive_window.unwrap_or(1_048_576);
     let conn_window = config.receive_window.unwrap_or(10_485_760);
     let send_window = config.send_window.unwrap_or(10_485_760);
-    transport.stream_receive_window((stream_window as u32).into());
-    transport.receive_window((conn_window as u32).into());
+    transport.stream_receive_window(varint("stream_receive_window", stream_window)?);
+    transport.receive_window(varint("receive_window", conn_window)?);
     transport.send_window(send_window);
 
     if let Some(ka) = config.keep_alive {
@@ -403,7 +470,7 @@ fn build_transport_config(config: &Config) -> quinn::TransportConfig {
         }
         CongestionController::Cubic => {} // Quinn default
     }
-    transport
+    Ok(transport)
 }
 
 /// Start a sQUIC server.
@@ -484,9 +551,13 @@ pub async fn listen(
         server_config.migration(false);
     }
 
-    let mut transport = build_transport_config(&config);
-    transport.max_concurrent_bidi_streams(config.max_incoming_streams.try_into().unwrap());
-    transport.max_concurrent_uni_streams(config.max_incoming_streams.try_into().unwrap());
+    let mut transport = build_transport_config(&config)?;
+    // Checked for the same reason as the windows, and here it also removes a
+    // panic: `try_into().unwrap()` aborted the process on any value a varint
+    // cannot hold, which is a library killing its caller over a tuning knob.
+    let streams = varint("max_incoming_streams", config.max_incoming_streams)?;
+    transport.max_concurrent_bidi_streams(streams);
+    transport.max_concurrent_uni_streams(streams);
     server_config.transport_config(Arc::new(transport));
 
     let runtime = quinn::default_runtime()
@@ -593,7 +664,7 @@ pub async fn dial(
         })?;
     let mut client_config = quinn::ClientConfig::new(Arc::new(quic_client_config));
 
-    let transport = build_transport_config(&config);
+    let transport = build_transport_config(&config)?;
     client_config.transport_config(Arc::new(transport));
 
     let runtime = quinn::default_runtime()

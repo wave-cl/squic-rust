@@ -1417,3 +1417,65 @@ async fn listen_refuses_an_accept_set_this_build_cannot_parse() {
         panic!("the implemented version was refused by the guard: {e}");
     }
 }
+
+/// T3: the window fields are `u64`, and QUIC varints hold 2^62 - 1, but they
+/// were cast `as u32` on the way to quinn. A caller asking for 8 GiB got the low
+/// 32 bits of it — zero — which is a *smaller* window than the default, and
+/// nothing said so.
+///
+/// The fix refuses rather than clamps, and that was measured. Clamping to
+/// `VarInt::MAX` was the first attempt and it is worse than the bug: every field
+/// binds happily at that value, and the process then grows without bound as soon
+/// as a stream carries data, because quinn sizes buffers from the window. Two
+/// test processes reached 3 GB before being killed.
+#[tokio::test]
+async fn a_window_no_varint_can_carry_is_refused_not_truncated() {
+    let (signing_key, pk) = squic::generate_keypair();
+    let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+
+    for (name, cfg) in [
+        ("stream_receive_window", Config { stream_receive_window: Some(u64::MAX), ..Default::default() }),
+        ("receive_window", Config { receive_window: Some(u64::MAX), ..Default::default() }),
+        ("max_incoming_streams", Config { max_incoming_streams: u64::MAX, ..Default::default() }),
+    ] {
+        let err = match squic::listen(addr, &signing_key, cfg.clone()).await {
+            Ok(_) => panic!("listen accepted {name} = u64::MAX"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains(name), "error does not name {name}: {err}");
+
+        // dial refuses it too, and for the same reason — max_incoming_streams
+        // is applied only on the listen path, so it is not expected there.
+        if name != "max_incoming_streams" {
+            let err = match squic::dial(addr, &pk, cfg).await {
+                Ok(_) => panic!("dial accepted {name} = u64::MAX"),
+                Err(e) => e.to_string(),
+            };
+            assert!(err.contains(name), "dial error does not name {name}: {err}");
+        }
+    }
+
+    // The control, and the half that matters: a large window that *does* fit is
+    // passed through untouched and carries a stream. Without this the test above
+    // would pass just as well against a build that refused every window.
+    let big = Config {
+        stream_receive_window: Some(64 << 20),
+        receive_window: Some(128 << 20),
+        max_incoming_streams: 4096,
+        ..Default::default()
+    };
+    let (listener, _sk, pk) = start_server(big.clone()).await;
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let conn = listener.accept().await.unwrap().await.unwrap();
+        let mut send = conn.open_uni().await.unwrap();
+        send.write_all(b"through").await.unwrap();
+        send.finish().unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    });
+    let conn = squic::dial(addr, &pk, big).await.expect("dial with a large but valid window");
+    let mut recv = conn.accept_uni().await.unwrap();
+    assert_eq!(recv.read_to_end(64).await.unwrap(), b"through");
+    conn.close(0u32.into(), b"");
+    let _ = server.await;
+}

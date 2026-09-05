@@ -376,15 +376,14 @@ impl ServerSocket {
         }
     }
 
-    /// Dispatch an Initial on its envelope version (SIP-29) and validate it.
+    /// Validate one Initial against its envelope version (SIP-29).
     ///
     /// The version marker is the **last byte of the datagram**, which is the
     /// only place a receiver can read without already knowing the trailer's
-    /// width — and knowing the width is what the marker is for. Version 1
-    /// predates the marker and carries none, so it is the fallback: its last
-    /// byte is the last byte of MAC2, uniformly random, and names version 2
-    /// about once in 256 packets. That costs one wasted parse before the
-    /// fallback succeeds, and nothing at all for the other 255.
+    /// width — and knowing the width is what the marker is for. One version is
+    /// implemented, so the byte is read once and dispatched once. The guessing
+    /// this replaced — try the marked version, then try unmarked version 1 —
+    /// is what let a single datagram be parsed twice.
     fn validate_and_strip(&self, buf: &mut [u8], len: usize, addr: Option<SocketAddr>) -> Option<usize> {
         // SIP-6 asks for silence toward anyone who cannot authenticate, and
         // the envelope alone does not deliver it: a long header carrying a
@@ -526,7 +525,7 @@ impl ServerSocket {
             //   neither        proves nothing. Silence.
             //
             // Challenging on a failed cookie check alone would answer strangers
-            // too, which is the defect MAC0 was added to close: a server under
+            // too, which is the defect the gate was added to close: a server under
             // load that replies to anyone has stopped being silent exactly when
             // it matters most.
             if addr.is_some_and(|a| self.gate_matches_cookie(hdr, covered, gate, a.ip())) {
@@ -658,7 +657,7 @@ impl ServerSocket {
     /// Start the background work the cookie defence depends on: one task
     /// tracking DH load, one rotating the cookie secret.
     ///
-    /// Without these `under_load` never becomes true and the whole MAC2 branch
+    /// Without these `under_load` never becomes true and the whole cookie branch
     /// is unreachable, and `prev_cookie_secret` never holds a secret that was
     /// actually in use. Both hold a `Weak` reference and stop as soon as the
     /// endpoint is dropped, so a short-lived server does not leak a pair of
@@ -841,11 +840,11 @@ pub struct ClientSocket {
     /// connection attempt, never a fallback — the server is silent, so a
     /// timeout would say nothing about which version it wanted.
     envelope_version: u8,
-    /// Keys MAC0 (envelope v3), derived from the server's public key.
+    /// Keys the gate tag when we hold no cookie; from the server's public key.
     gate_key: [u8; 32],
     cookie_key: [u8; 32], // decrypts cookie replies; derived from the server's public key
     handshake_done: AtomicBool, // true after first non-cookie packet received; skips the cookie scan
-    cookie: RwLock<Option<[u8; 16]>>, // decrypted cookie from the server, keys MAC2
+    cookie: RwLock<Option<[u8; 16]>>, // decrypted cookie from the server; keys the gate tag
     // The most recent Initial datagram and where it went, so a cookie
     // challenge can be answered immediately rather than at the next PTO.
     last_initial: RwLock<Option<(Vec<u8>, SocketAddr)>>,
@@ -866,7 +865,7 @@ pub struct ClientKeys {
     pub client_pub_key: [u8; 32],
     /// SIP-3: the Ed25519 identity to advertise, or all zeros for none.
     pub advertise_ed25519: [u8; 32],
-    /// Keys MAC0 (envelope v3); derived from the server's public key.
+    /// Keys the gate tag when we hold no cookie; from the server's public key.
     pub gate_key: [u8; 32],
     /// Decrypts cookie replies; derived from the server's public key.
     pub cookie_key: [u8; 32],
@@ -952,7 +951,7 @@ impl ClientSocket {
 
     /// Open a cookie reply and keep the cookie for the next Initial.
     ///
-    /// The reply arrives encrypted; MAC2 is keyed on the plaintext, so it has
+    /// The reply arrives encrypted; the gate tag is keyed on the plaintext, so it has
     /// to be opened here. A reply we cannot open did not come from a server
     /// holding the key we expect, so it is dropped and any cookie we already
     /// had is kept. Returns whether a cookie was stored.
@@ -981,7 +980,8 @@ impl ClientSocket {
         true
     }
 
-    /// Re-send the last Initial straight away, now carrying MAC2.
+    /// Re-send the last Initial straight away, its gate tag now keyed on the
+    /// cookie instead of the server's public key.
     ///
     /// Quinn never sees a cookie reply — poll_recv strips them out — so left to
     /// itself it would not retransmit until its next PTO, roughly a second. The
@@ -989,7 +989,7 @@ impl ClientSocket {
     /// second per challenge, so answer it here. WireGuard does the same.
     ///
     /// Replaying the datagram is sound. The server dropped the original at the
-    /// MAC2 gate before quinn ever saw it, so this is the first time that packet
+    /// gate before quinn ever saw it, so this is the first time that packet
     /// number reaches the peer; in the case where it did get through (under-load
     /// cleared in between) quinn discards the duplicate. Only the sQUIC envelope
     /// is rebuilt — fresh timestamp, nonce and MAC1 — never the QUIC packet.
@@ -1015,7 +1015,7 @@ impl ClientSocket {
     ///
     /// Kept separate from the send so a test can check the bytes against what
     /// `ServerSocket::validate_and_strip` expects — the two sides disagreeing
-    /// about what MAC2 covers is exactly the defect this guards.
+    /// about what the gate tag covers is exactly the defect this guards.
     fn build_initial(&self, datagram: &[u8], cookie: Option<&[u8; 16]>) -> Vec<u8> {
         // An identity is carried only when there is one to carry. The header
         // byte says which, so the server knows the trailer's width before it
@@ -1249,7 +1249,7 @@ mod tests {
     }
 
     /// The four-way defect this pins down: the client has to be able to open
-    /// the cookie at all, and then MAC2 has to cover exactly the bytes the
+    /// the cookie at all, and then the cookie-keyed gate tag has to cover exactly the bytes the
     /// server checks. Any of those disagreeing and the cookie defence rejects
     /// every legitimate client instead of only attackers.
     #[tokio::test]
@@ -1388,8 +1388,9 @@ mod tests {
         );
     }
 
-    /// Not under load, MAC2 is not consulted, so the zeros a fresh client sends
-    /// are fine. This is the path every normal connection takes.
+    /// Not under load, a cookie is not required: a fresh client that holds none
+    /// keys its gate tag on the server's public key and is accepted. This is
+    /// the path every normal connection takes.
     #[tokio::test]
     async fn without_load_no_cookie_is_required() {
         let (server, client) = pair().await;

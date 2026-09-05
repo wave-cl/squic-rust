@@ -225,7 +225,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 /// Compute a deterministic cookie for a (secret, IP) pair.
-/// cookie = HMAC-SHA256(secret, ip)[:16]
+/// `cookie = HMAC-SHA256(secret, ip)[:16]`
 pub fn cookie_value(secret: &[u8; 32], client_ip: IpAddr) -> [u8; 16] {
     let ip_bytes = match client_ip {
         IpAddr::V4(v4) => {
