@@ -85,26 +85,42 @@ for lock in "$SCAN_DIR"/*/Cargo.lock; do
     repo="$(basename "$(dirname "$lock")")"
     [ "$(dirname "$lock")" = "$SQUIC_DIR" ] && continue
 
-    # Every squic version this lock resolves, direct or transitive. awk rather
-    # than grep -A because a package block's fields are not at fixed offsets.
+    # Every squic version this lock resolves, direct or transitive, tagged with
+    # how it got there. awk rather than grep -A because a package block's fields
+    # are not at fixed offsets.
+    #
+    # The `source` line is the discriminator, and it matters: a lock entry with
+    # no source is a **path** dependency, resolved from this working tree rather
+    # than pinned to anything. Its version is whatever the tree said when the
+    # lock was last written, so it can name an old release while pointing at the
+    # current one — which is exactly what bti did, and what an earlier version
+    # of this script mislabelled as "behind", implying a pin to bump when there
+    # was none. Only pinned entries can be stale in the sense this scan is for.
     versions=$(awk '
-        /^\[\[package\]\]/ { name=""; ver="" }
+        /^\[\[package\]\]/ { name=""; ver=""; src="path" }
         /^name = "squic"$/ { name="squic" }
-        /^version = / && name=="squic" { gsub(/[",]/,"",$3); print $3; name="" }
+        /^source = / && name=="squic" { src="pinned" }
+        /^version = / && name=="squic" { gsub(/[",]/,"",$3); ver=$3 }
+        /^$/ && name=="squic" && ver!="" { print ver "|" src; name=""; ver="" }
+        END { if (name=="squic" && ver!="") print ver "|" src }
     ' "$lock" | sort -u)
     [ -n "$versions" ] || continue
     checked=$((checked+1))
 
-    for v in $versions; do
+    for entry in $versions; do
+        v="${entry%|*}" src="${entry#*|}"
+
+        # A path dep tracks this checkout by construction. Its recorded version
+        # is only as fresh as the last `cargo build`, so it says nothing about
+        # what the consumer will actually compile against.
+        if [ "$src" = "path" ]; then
+            [ "$QUIET" = 1 ] || printf '  %-14s squic %-8s path dep — tracks this checkout\n' "$repo" "$v"
+            continue
+        fi
+
         emits=$(emitted_by "$v")
         if [ -z "$emits" ]; then
-            # No such tag. A path dependency resolves to the working tree, which
-            # is this checkout — current by construction.
-            if grep -q "name = \"squic\"" "$lock" && ! grep -q "squic-rust?tag=v$v" "$lock"; then
-                [ "$QUIET" = 1 ] || printf '  %-14s squic %-8s path dep — tracks this checkout\n' "$repo" "$v"
-            else
-                printf '  %-14s squic %-8s UNKNOWN: no tag v%s in %s\n' "$repo" "$v" "$v" "$SQUIC_DIR"
-            fi
+            printf '  %-14s squic %-8s UNKNOWN: no tag v%s in %s\n' "$repo" "$v" "$v" "$SQUIC_DIR"
             continue
         fi
 
