@@ -1,6 +1,6 @@
 [package]
 name = "squic"
-version = "0.26.0"
+version = "0.26.1"
 edition = "2024"
 description = "Shielded QUIC: silent server, key-pinned identity, runtime client whitelisting"
 license = "MIT"
