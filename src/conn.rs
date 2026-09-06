@@ -278,6 +278,9 @@ pub struct ServerSocket {
     prev_cookie_secret: RwLock<[u8; 32]>,
     under_load: AtomicBool,
     dh_count: AtomicU64,
+    // Offered key-holder work this second (DHs + cookie challenges): the monitor's
+    // load signal, which stays high even while under-load suppresses DHs.
+    load_count: AtomicU64,
     cookie_replies: AtomicU64,
     mac2_verified: AtomicU64,
     /// Initials accepted, per envelope version, indexed as [`ENVELOPE_VERSIONS`].
@@ -371,6 +374,7 @@ impl ServerSocket {
             prev_cookie_secret: RwLock::new(secret),
             under_load: AtomicBool::new(false),
             dh_count: AtomicU64::new(0),
+            load_count: AtomicU64::new(0),
             cookie_replies: AtomicU64::new(0),
             mac2_verified: AtomicU64::new(0),
             accepted: [const { AtomicU64::new(0) }; ENVELOPE_VERSIONS.len()],
@@ -543,6 +547,10 @@ impl ServerSocket {
             if addr.is_some_and(|a| self.gate_matches_cookie(hdr, covered, gate, a.ip())) {
                 self.mac2_verified.fetch_add(1, Ordering::Relaxed);
             } else if verify_gate(hdr, &self.gate_key, covered, gate) {
+                // A challenge is offered load too: counting it keeps the monitor
+                // engaged under a sustained key-gate flood, which challenges
+                // rather than DHs and would otherwise starve a DH-only signal.
+                self.load_count.fetch_add(1, Ordering::Relaxed);
                 return Outcome::Challenge;
             } else {
                 return Outcome::Drop;
@@ -565,6 +573,7 @@ impl ServerSocket {
 
         // Step 5: DH + MAC1 verification (expensive)
         self.dh_count.fetch_add(1, Ordering::Relaxed);
+        self.load_count.fetch_add(1, Ordering::Relaxed);
         let client_x25519 = X25519Public::from(key);
         let shared = self.server_x25519_priv.diffie_hellman(&client_x25519);
 
@@ -689,12 +698,36 @@ impl ServerSocket {
             // The first tick completes immediately, over a window that has not
             // elapsed yet. Discard it rather than judging load on no data.
             ticker.tick().await;
+            // Hysteresis: enter under-load on crossing the threshold, but leave
+            // only after the rate has stayed at or below a low-water mark (half
+            // the threshold) for RELEASE_AFTER consecutive seconds. A single
+            // threshold oscillates under a sustained flood — it drops out on any
+            // 1s window that dips below the line, and Initials forwarded in those
+            // windows evade the cookie defence, which is exactly when it must
+            // hold. The signal is load_count (DHs + challenges), not dh_count, so
+            // it does not fall to zero the moment under-load starts challenging
+            // rather than DH-ing.
+            const RELEASE_AFTER: u32 = 5;
+            let mut quiet: u32 = 0;
             loop {
                 ticker.tick().await;
                 let Some(s) = weak.upgrade() else { return };
-                let count = s.dh_count.swap(0, Ordering::Relaxed);
-                s.under_load
-                    .store(count > s.load_threshold, Ordering::Relaxed);
+                let count = s.load_count.swap(0, Ordering::Relaxed);
+                let low_water = s.load_threshold / 2;
+                if count > s.load_threshold {
+                    quiet = 0;
+                    s.under_load.store(true, Ordering::Relaxed);
+                } else if s.under_load.load(Ordering::Relaxed) {
+                    if count <= low_water {
+                        quiet += 1;
+                        if quiet >= RELEASE_AFTER {
+                            s.under_load.store(false, Ordering::Relaxed);
+                            quiet = 0;
+                        }
+                    } else {
+                        quiet = 0;
+                    }
+                }
             }
         });
 

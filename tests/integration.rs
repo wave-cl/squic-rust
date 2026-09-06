@@ -593,8 +593,13 @@ async fn assert_handshake_survives_losing(lost: usize) {
 }
 
 /// Poll until the server's under-load state reaches `want`, or give up.
-async fn wait_for_under_load(listener: &squic::ServerListener, want: bool) -> bool {
-    for _ in 0..80 {
+async fn wait_for_under_load(
+    listener: &squic::ServerListener,
+    want: bool,
+    within: Duration,
+) -> bool {
+    let deadline = std::time::Instant::now() + within;
+    while std::time::Instant::now() < deadline {
         if listener.load_stats().under_load == want {
             return true;
         }
@@ -689,12 +694,26 @@ async fn test_load_monitor_raises_and_clears_under_load() {
     }
 
     assert!(
-        wait_for_under_load(&listener, true).await,
+        wait_for_under_load(&listener, true, Duration::from_secs(4)).await,
         "load monitor never raised under_load"
     );
+
+    // Hysteresis: a brief lull must NOT clear under-load. The dials have
+    // stopped, so this is a genuine lull; two seconds is well short of the
+    // release debounce, so the server must still be engaged. Without this the
+    // monitor oscillates and forwards Initials past the cookie defence in the
+    // windows it drops out.
+    tokio::time::sleep(Duration::from_secs(2)).await;
     assert!(
-        wait_for_under_load(&listener, false).await,
-        "under_load never cleared once the load stopped"
+        listener.load_stats().under_load,
+        "under_load cleared during a brief lull; hysteresis must hold through short dips"
+    );
+
+    // A sustained lull clears it on its own — an operator does not have to.
+    // This takes the release debounce, so allow well beyond it.
+    assert!(
+        wait_for_under_load(&listener, false, Duration::from_secs(10)).await,
+        "under_load never cleared after a sustained lull"
     );
 }
 
@@ -725,7 +744,7 @@ async fn test_zero_load_threshold_disables_the_cookie_defence() {
             .unwrap();
     }
     assert!(
-        !wait_for_under_load(&listener, true).await,
+        !wait_for_under_load(&listener, true, Duration::from_secs(2)).await,
         "cookie defence engaged despite being disabled"
     );
     assert_eq!(listener.load_stats().cookie_replies_sent, 0);
