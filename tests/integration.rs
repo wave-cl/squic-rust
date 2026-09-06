@@ -1840,3 +1840,73 @@ async fn test_max_connections_caps_established() {
     );
     drop((c2, c4));
 }
+
+/// SIP-25's two halves, composed: a dialer pins its source port (`local_bind`)
+/// and punches the listener, the listener punches back, and a real connection
+/// establishes through the pinned/punched socket — with the server observing
+/// the pinned source port a peer would have been told to expect. squic's other
+/// punch tests fire datagrams at a passive socket and never connect; this is
+/// the only one that punches *and* connects.
+///
+/// On loopback there is no NAT, so this proves the mechanism composes, not that
+/// it survives a real NAT — that needs two homes (see SIP-25, which stays Draft
+/// for exactly that reason).
+#[tokio::test]
+async fn a_pinned_punched_dial_connects_and_is_seen_on_its_pinned_port() {
+    // Bob's source port: bound, read back, released. squic uses what it is
+    // given; reserving it is not the point.
+    let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let bob_port = probe.local_addr().unwrap();
+    drop(probe);
+
+    // Alice listens and punches toward Bob's port (a no-op on loopback, but the
+    // listener-punches-too path is what runs).
+    let (listener, _key, alice_pub) = start_server(Config {
+        punch: vec![bob_port],
+        ..Default::default()
+    })
+    .await;
+    let alice_addr = listener.local_addr().unwrap();
+
+    let seen: Arc<Mutex<Vec<SocketAddr>>> = Arc::new(Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&seen);
+    let accepting = tokio::spawn(async move {
+        if let Some(incoming) = listener.accept().await
+            && let Ok(conn) = incoming.await
+        {
+            recorded.lock().unwrap().push(conn.remote_address());
+        }
+    });
+
+    // Bob dials from his pinned port, punching Alice first.
+    let conn = squic::dial(
+        alice_addr,
+        &alice_pub,
+        Config {
+            local_bind: Some(bob_port),
+            punch: vec![alice_addr],
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("pinned + punched dial did not connect");
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while seen.lock().unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the listener never accepted the pinned dial");
+
+    let observed = seen.lock().unwrap().clone();
+    assert_eq!(observed.len(), 1);
+    assert_eq!(
+        observed[0].port(),
+        bob_port.port(),
+        "the pinned + punched dial did not arrive from its bound port: {observed:?}"
+    );
+
+    drop(conn);
+    accepting.abort();
+}
