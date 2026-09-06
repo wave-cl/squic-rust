@@ -1780,3 +1780,63 @@ async fn a_punch_list_is_bounded() {
     }
     drop(listener);
 }
+
+/// A server with `max_connections` set drops Initials once that many
+/// connections are established — the memory bound iteration-2 testing showed
+/// was missing (N held connections each cost their receive window). Two
+/// connections fit; the third is refused in silence; freeing one lets a new
+/// one in.
+#[tokio::test]
+async fn test_max_connections_caps_established() {
+    let (listener, _key, pub_key) = start_server(Config {
+        max_connections: Some(2),
+        ..Default::default()
+    })
+    .await;
+    let addr = listener.local_addr().unwrap();
+    let listener = Arc::new(listener);
+
+    // Server holds every connection it accepts, so the count actually stays up.
+    let held: Arc<Mutex<Vec<quinn::Connection>>> = Arc::new(Mutex::new(Vec::new()));
+    let acc = listener.clone();
+    let held_srv = held.clone();
+    tokio::spawn(async move {
+        while let Some(inc) = acc.accept().await {
+            let held_srv = held_srv.clone();
+            tokio::spawn(async move {
+                if let Ok(conn) = inc.await {
+                    held_srv.lock().unwrap().push(conn);
+                }
+            });
+        }
+    });
+
+    let short = || Config {
+        handshake_timeout: Some(Duration::from_secs(2)),
+        ..Default::default()
+    };
+
+    // Two connections fit under the cap.
+    let c1 = squic::dial(addr, &pub_key, short()).await.expect("conn 1");
+    let c2 = squic::dial(addr, &pub_key, short()).await.expect("conn 2");
+    // Let the server register both as established before probing the cap.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // The third is over the cap: its Initial is ignored, so the dial times out.
+    let c3 = squic::dial(addr, &pub_key, short()).await;
+    assert!(
+        c3.is_err(),
+        "a third connection was admitted past a cap of 2"
+    );
+
+    // Free one and a new connection is admitted again.
+    c1.close(0u32.into(), b"done");
+    drop(c1);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let c4 = squic::dial(addr, &pub_key, short()).await;
+    assert!(
+        c4.is_ok(),
+        "no connection admitted after one was freed below the cap"
+    );
+    drop((c2, c4));
+}

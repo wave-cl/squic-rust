@@ -295,6 +295,22 @@ pub struct Config {
     /// asked an exchange to be introduced. Nothing here can enforce that; the
     /// transport takes an address and sends to it.
     pub punch: Vec<SocketAddr>,
+
+    /// Server: cap on the number of concurrently *established* connections.
+    ///
+    /// Each accepted connection can hold up to its receive window (see
+    /// [`Config::receive_window`], ~10 MB by default) of unread data, and the
+    /// transport has no other ceiling on how many may be open at once — so a
+    /// caller that completes handshakes and holds connections open can drive
+    /// server memory to N × the window. This bounds N. When the count of
+    /// established connections is at or above the cap, further Initials are
+    /// dropped in silence (the caller proved its key at the envelope, but the
+    /// server is full), exactly like any other refusal.
+    ///
+    /// Default: `None` — unlimited, the historical behaviour. A public,
+    /// whitelist-off deployment should set a finite value sized to its memory
+    /// budget (`cap × receive_window`). Ignored on the client.
+    pub max_connections: Option<u64>,
 }
 
 /// Addresses one [`Config::punch`] may name.
@@ -331,6 +347,7 @@ impl Default for Config {
             accepted_envelope_versions: vec![crate::mac::ENVELOPE_V4],
             local_bind: None,
             punch: Vec::new(),
+            max_connections: None,
         }
     }
 }
@@ -367,12 +384,27 @@ pub struct ServerListener {
     whitelist: Arc<Whitelist>,
     socket: Arc<ServerSocket>,
     public_key: [u8; 32],
+    max_connections: Option<u64>,
 }
 
 impl ServerListener {
     /// Accept the next incoming connection.
     pub async fn accept(&self) -> Option<quinn::Incoming> {
-        self.endpoint.accept().await
+        loop {
+            let incoming = self.endpoint.accept().await?;
+            // Cap concurrently-established connections. quinn tracks the live
+            // count and decrements it on close, so no bookkeeping of our own is
+            // needed; over the cap we drop the Initial in silence rather than
+            // refuse it, keeping the server's no-reply posture.
+            let at_capacity = self
+                .max_connections
+                .is_some_and(|cap| self.endpoint.open_connections() as u64 >= cap);
+            if at_capacity {
+                incoming.ignore();
+                continue;
+            }
+            return Some(incoming);
+        }
     }
 
     /// This server's Ed25519 public key — the one clients pin when they dial.
@@ -649,6 +681,7 @@ pub async fn listen(
         whitelist,
         socket: server_socket,
         public_key: signing_key.verifying_key().to_bytes(),
+        max_connections: config.max_connections,
     })
 }
 
